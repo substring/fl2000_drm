@@ -416,6 +416,62 @@ probe_only now always ends by reading `0x8000` and logging the decoded
 monitor-detect status (C), so each step's rescan also shows what the chip
 thinks is connected.
 
+## Round 3 results — both software candidates eliminated; the chip agrees DDC is dead
+
+Loop run with the ddc_step build (probe_only, rmmod/insmod between steps,
+0x50 rescan after each):
+
+| step | init variation | 0x8000 decode | 0x50 |
+|---|---|---|---|
+| 0 | baseline | `0x600000e1` connected **1** edid_connected **0** ext_mon **1** pll_up 1 dac_up 1 | NAK |
+| 1 | + staged enable (bit 30 alone, 750 ms settle) | `0x200000c1` same flags | NAK |
+| 2 | + `usb_set_interface(0, 1)` first | `0x200000c1` same flags | NAK |
+
+0x30 control-read ACKed in every round, so the I2C master stayed healthy
+throughout. With the restored NAK check, a NAKed read now surfaces as a clean
+I/O error instead of returning bus garbage.
+
+The 0x8000 decode is the significant new evidence:
+
+- **`connected = 1`** — the chip's analog monitor-detect circuit (load sensing
+  on the RGB lines) sees the monitor. Detection hardware works, dongle-to-
+  monitor analog wiring works.
+- **`edid_connected = 0`** — the chip's *own* EDID-detect circuit cannot see
+  the DDC EEPROM. The chip independently reports exactly what our reads
+  experience. This is not a register we forgot; the hardware itself observes
+  no device on the DDC lines.
+
+The 750 ms settle and the altsetting workaround made no difference to either
+flag or to the reads.
+
+### The device at 0x30
+
+Dumped offsets 0x00-0x1f: `08 05 01 52 92 04 24 09 00 00 00 00 0a 00 ...` —
+structured but not an EDID and not obviously monitor-side. 7-bit 0x30 happens
+to be the E-DDC segment pointer address (8-bit 0x60), which would place it in
+the *monitor*, but a segment pointer does not normally back a 16-byte memory.
+More likely a dongle-internal configuration EEPROM. Discriminator (physical):
+detach the VGA cable at the dongle and re-read 0x30 — if it stops ACKing it
+was the monitor and the DDC wires are electrically alive after all.
+
+### Leading remaining theory: monitor deep-standby DDC power-down
+
+Windows works on this exact chain, but with a crucial difference in dynamics:
+Windows lights the display *immediately* on plug-in, so the monitor never
+enters deep standby. Under our probe_only testing the monitor has been sitting
+for hours with no video signal. Many monitors keep their EDID EEPROM powered
+from the DDC +5V line permanently, but some cut DDC power in deep sleep while
+the passive 75 ohm terminations that trip the analog load detect stay
+present — which would produce precisely the observed signature:
+`connected = 1`, `edid_connected = 0`, EEPROM NAK.
+
+This theory fits every observation and explains the Windows result without
+requiring any undiscovered register. Test: wake the monitor (power-cycle it so
+it is actively showing its "no signal" OSD) and rescan 0x50 within the first
+seconds. If it ACKs, the "fix" is behavioural, not register-level: the driver
+should retry EDID after enabling video output, and the EDID-less fallback
+carries the first modeset.
+
 ## Debugging notes
 
 - regmap debugfs exists at `/sys/kernel/debug/regmap/2-4/` but is of limited
