@@ -19,6 +19,13 @@
 #define FL2000_ALL_IFS \
 	(BIT(FL2000_USBIF_AVCONTROL) | BIT(FL2000_USBIF_STREAMING) | BIT(FL2000_USBIF_INTERRUPT))
 
+bool fl2000_vga_mode;
+module_param_named(vga_mode, fl2000_vga_mode, bool, 0444);
+MODULE_PARM_DESC(vga_mode,
+		 "Drive the FL2000 integrated VGA DAC directly (default 0). VGA dongles have no "
+		 "IT66121 bridge chip, so the component match never completes and the display "
+		 "pipeline never comes up; set this to bring up a VGA connector instead");
+
 static struct usb_device_id fl2000_id_table[] = {
 	{ USB_DEVICE_INTERFACE_CLASS(USB_VENDOR_FRESCO_LOGIC, USB_PRODUCT_FL2000, USB_CLASS_AV) },
 	{},
@@ -32,6 +39,7 @@ struct fl2000_devs {
 	struct component_match *match;
 	int active_if;
 	bool master_added;
+	bool drm_bound;
 };
 
 static struct component_master_ops fl2000_master_ops = {
@@ -152,13 +160,27 @@ static int fl2000_probe(struct usb_interface *interface, const struct usb_device
 		fl2000_reset(usb_dev);
 		fl2000_usb_magic(usb_dev);
 
-		ret = component_master_add_with_match(&devs->adapter->dev, &fl2000_master_ops,
-						      devs->match);
-		if (ret) {
-			dev_err(&usb_dev->dev, "Cannot register component master (%d)", ret);
-			return ret;
+		if (fl2000_vga_mode) {
+			/* Nothing to wait for: a VGA dongle has no bridge chip, so bind the DRM
+			 * device straight away rather than registering a component master that
+			 * would never be satisfied
+			 */
+			ret = fl2000_drm_bind(&devs->adapter->dev);
+			if (ret) {
+				dev_err(&usb_dev->dev, "Cannot bind DRM device (%d)", ret);
+				return ret;
+			}
+			devs->drm_bound = true;
+		} else {
+			ret = component_master_add_with_match(&devs->adapter->dev,
+							      &fl2000_master_ops, devs->match);
+			if (ret) {
+				dev_err(&usb_dev->dev, "Cannot register component master (%d)",
+					ret);
+				return ret;
+			}
+			devs->master_added = true;
 		}
-		devs->master_added = true;
 	}
 
 	return ret;
@@ -176,6 +198,11 @@ static void fl2000_disconnect(struct usb_interface *interface)
 	if (devs->master_added) {
 		component_master_del(&devs->adapter->dev, &fl2000_master_ops);
 		devs->master_added = false;
+	}
+
+	if (devs->drm_bound) {
+		fl2000_drm_unbind(&devs->adapter->dev);
+		devs->drm_bound = false;
 	}
 
 	switch (iface_num) {

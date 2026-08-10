@@ -38,6 +38,7 @@
 #include <drm/drm_simple_kms_helper.h>
 #include <drm/drm_crtc_helper.h>
 #include <drm/drm_probe_helper.h>
+#include <drm/drm_edid.h>
 #include <drm/drm_damage_helper.h>
 #include <drm/drm_fb_dma_helper.h>
 
@@ -177,6 +178,14 @@ int fl2000_set_pll(struct usb_device *usb_dev, struct fl2000_pll *pll);
 int fl2000_enable_interrupts(struct usb_device *usb_dev);
 int fl2000_check_interrupt(struct usb_device *usb_dev);
 int fl2000_i2c_dword(struct usb_device *usb_dev, bool read, u16 addr, u8 offset, u32 *data);
+
+/* I2C address of the monitor's DDC/EDID EEPROM, reached over the FL2000's own I2C master */
+#define FL2000_DDC_ADDR 0x50
+
+/* Drive the integrated VGA DAC directly instead of waiting for an external bridge component.
+ * Defined in fl2000_drv.c
+ */
+extern bool fl2000_vga_mode;
 
 /* DRM device creation */
 int fl2000_drm_bind(struct device *master);

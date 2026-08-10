@@ -92,6 +92,88 @@ struct fl2000_drm_if {
 	struct drm_simple_display_pipe pipe;
 	struct fl2000_stream *stream;
 	struct fl2000_intr *intr;
+
+	/* Only used when driving the integrated VGA DAC, i.e. when there is no bridge component */
+	struct drm_connector connector;
+	const struct drm_edid *drm_edid;
+};
+
+/* Read one EDID block over the FL2000's own I2C master.
+ *
+ * This deliberately bypasses the i2c_adapter the driver registers. That adapter describes the
+ * hardware honestly - fl2000_i2c_quirks advertises max_read_len = 1 - so drm_edid_read_ddc() and
+ * friends are rejected by i2c_check_quirks() before any transfer happens. It is also wasteful:
+ * fl2000_i2c_xfer() reads a full dword from the chip and then throws three of the four bytes away.
+ * Going straight to fl2000_i2c_dword() keeps all four, turning a 128 byte block into 32 USB
+ * round trips rather than 128
+ */
+static int fl2000_get_edid_block(void *data, u8 *buf, unsigned int block, size_t len)
+{
+	struct fl2000_drm_if *drm_if = data;
+	struct usb_device *usb_dev = drm_if->usb_dev;
+	unsigned int base = block * EDID_LENGTH;
+
+	/* i2c_offset in FL2000_VGA_I2C_SC_REG is 8 bits wide and there is no E-DDC segment
+	 * pointer, so only the base block and one extension are reachable
+	 */
+	if (base + len > 256)
+		return -E2BIG;
+
+	for (size_t i = 0; i < len; i += sizeof(u32)) {
+		union {
+			u32 w;
+			u8 b[4];
+		} dword;
+		int ret;
+
+		ret = fl2000_i2c_dword(usb_dev, true, FL2000_DDC_ADDR, base + i, &dword.w);
+		if (ret)
+			return ret;
+
+		memcpy(&buf[i], dword.b, min_t(size_t, sizeof(dword.b), len - i));
+	}
+
+	return 0;
+}
+
+static int fl2000_connector_get_modes(struct drm_connector *connector)
+{
+	struct fl2000_drm_if *drm_if = container_of(connector, struct fl2000_drm_if, connector);
+
+	/* Re-read rather than cache: a VGA sink can be swapped without us being told */
+	drm_edid_free(drm_if->drm_edid);
+	drm_if->drm_edid = drm_edid_read_custom(connector, fl2000_get_edid_block, drm_if);
+
+	drm_edid_connector_update(connector, drm_if->drm_edid);
+
+	return drm_edid_connector_add_modes(connector);
+}
+
+/* VGA has no hotplug detect line, so probe the sink by talking to its DDC EEPROM */
+static enum drm_connector_status fl2000_connector_detect(struct drm_connector *connector, bool force)
+{
+	struct fl2000_drm_if *drm_if = container_of(connector, struct fl2000_drm_if, connector);
+	u32 header;
+
+	UNUSED(force);
+
+	if (fl2000_i2c_dword(drm_if->usb_dev, true, FL2000_DDC_ADDR, 0, &header))
+		return connector_status_disconnected;
+
+	return connector_status_connected;
+}
+
+static const struct drm_connector_helper_funcs fl2000_connector_helper_funcs = {
+	.get_modes = fl2000_connector_get_modes,
+};
+
+static const struct drm_connector_funcs fl2000_connector_funcs = {
+	.detect = fl2000_connector_detect,
+	.fill_modes = drm_helper_probe_single_connector_modes,
+	.destroy = drm_connector_cleanup,
+	.reset = drm_atomic_helper_connector_reset,
+	.atomic_duplicate_state = drm_atomic_helper_connector_duplicate_state,
+	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
 };
 
 DEFINE_DRM_GEM_DMA_FOPS(fl2000_drm_driver_fops);
@@ -412,27 +494,33 @@ static const struct drm_encoder_helper_funcs fl2000_encoder_funcs = {
 	.mode_set = fl2000_output_mode_set,
 };
 
-static void fl2000_drm_if_release(struct device *dev, void *res)
+static void fl2000_drm_if_release(struct fl2000_drm_if *drm_if, struct device *master)
 {
-	struct fl2000_drm_if *drm_if = res;
 	struct drm_device *drm = &drm_if->drm;
 	struct usb_device *usb_dev = drm_if->usb_dev;
 
-	dev_info(dev, "Unbinding FL2000 master");
+	dev_info(master, "Unbinding FL2000 master");
 
-	/* Detach bridge */
-	component_unbind_all(dev, drm);
+	/* Detach bridge. Nothing was bound in VGA mode */
+	if (!fl2000_vga_mode)
+		component_unbind_all(master, drm);
 
-	/* Start streaming interface */
+	/* Stop streaming interface */
 	fl2000_stream_destroy(usb_dev);
 
-	/* Start interrupts interface */
+	/* Stop interrupts interface */
 	fl2000_intr_destroy(usb_dev);
 
 	/* Prepare to DRM device shutdown */
 	drm_kms_helper_poll_fini(drm);
 	drm_dev_unplug(drm);
-	drm_dev_put(drm);
+
+	drm_edid_free(drm_if->drm_edid);
+	drm_if->drm_edid = NULL;
+
+	/* No drm_dev_put() here - the drm_device came from devm_drm_dev_alloc(master) and is
+	 * released with the master device
+	 */
 }
 
 /* TODO: release on errors! */
@@ -456,6 +544,11 @@ int fl2000_drm_bind(struct device *master)
 	drm_if->usb_dev = usb_dev;
 	drm->dev_private = drm_if;
 
+	/* Let fl2000_drm_unbind() find us again. master is the i2c adapter device, whose drvdata
+	 * is otherwise unused - this driver never calls i2c_set_adapdata()
+	 */
+	dev_set_drvdata(master, drm_if);
+
 	ret = drmm_mode_config_init(drm);
 	if (ret) {
 		dev_err(master, "Cannot initialize DRM mode (%d)", ret);
@@ -477,9 +570,28 @@ int fl2000_drm_bind(struct device *master)
 		return ret;
 	}
 
+	/* On a VGA dongle there is no bridge chip, so stand up our own connector for the chip's
+	 * integrated DAC and hand it to the pipe. Must happen before the pipe is initialised,
+	 * which is what attaches the connector to the encoder
+	 */
+	if (fl2000_vga_mode) {
+		drm_connector_helper_add(&drm_if->connector, &fl2000_connector_helper_funcs);
+
+		/* No HPD line on VGA, so rely on periodic polling of the DDC bus */
+		drm_if->connector.polled =
+			DRM_CONNECTOR_POLL_CONNECT | DRM_CONNECTOR_POLL_DISCONNECT;
+
+		ret = drm_connector_init(drm, &drm_if->connector, &fl2000_connector_funcs,
+					 DRM_MODE_CONNECTOR_VGA);
+		if (ret) {
+			dev_err(drm->dev, "Cannot initialize VGA connector (%d)", ret);
+			return ret;
+		}
+	}
+
 	ret = drm_simple_display_pipe_init(drm, &drm_if->pipe, &fl2000_display_funcs,
 					   fl2000_pixel_formats, ARRAY_SIZE(fl2000_pixel_formats),
-					   NULL, NULL);
+					   NULL, fl2000_vga_mode ? &drm_if->connector : NULL);
 	if (ret) {
 		dev_err(drm->dev, "Cannot configure simple display pipe (%d)", ret);
 		return ret;
@@ -494,11 +606,15 @@ int fl2000_drm_bind(struct device *master)
 	/* Start interrupts interface */
 	drm_if->intr = fl2000_intr_create(usb_dev, drm);
 
-	/* Attach bridge */
-	ret = component_bind_all(master, &drm_if->pipe);
-	if (ret) {
-		dev_err(drm->dev, "Cannot attach bridge (%d)", ret);
-		return ret;
+	/* Attach bridge. In VGA mode there is no component to bind - the connector created above
+	 * stands in for it
+	 */
+	if (!fl2000_vga_mode) {
+		ret = component_bind_all(master, &drm_if->pipe);
+		if (ret) {
+			dev_err(drm->dev, "Cannot attach bridge (%d)", ret);
+			return ret;
+		}
 	}
 
 	drm_mode_config_reset(drm);
@@ -530,7 +646,16 @@ int fl2000_drm_bind(struct device *master)
 
 void fl2000_drm_unbind(struct device *master)
 {
-	struct usb_device *usb_dev = to_usb_device(master->parent);
+	struct fl2000_drm_if *drm_if = dev_get_drvdata(master);
 
-	devres_release(&usb_dev->dev, fl2000_drm_if_release, NULL, NULL);
+	/* This used to devres_release() fl2000_drm_if_release from &usb_dev->dev, but that
+	 * callback was never registered as a devres, so the release silently did nothing and the
+	 * DRM device was never torn down
+	 */
+	if (!drm_if)
+		return;
+
+	dev_set_drvdata(master, NULL);
+
+	fl2000_drm_if_release(drm_if, master);
 }
