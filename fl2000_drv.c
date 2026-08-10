@@ -180,14 +180,14 @@ static int fl2000_probe(struct usb_interface *interface, const struct usb_device
 		 * I2C master and the monitor detect circuit are enabled by fl2000_usb_magic(), so
 		 * until this runs no EDID can be read over DDC
 		 */
-		if (fl2000_ddc_step >= 2) {
+		if (fl2000_ddc_step == 2) {
 			ret = usb_set_interface(usb_dev, 0, 1);
 			dev_info(&usb_dev->dev, "ddc_step2: usb_set_interface(0, 1) = %d", ret);
 		}
 
 		fl2000_reset(usb_dev);
 
-		if (fl2000_ddc_step >= 1) {
+		if (fl2000_ddc_step == 1 || fl2000_ddc_step == 2) {
 			ret = fl2000_ddc_detect_enable_staged(usb_dev);
 			dev_info(&usb_dev->dev, "ddc_step1: staged detect enable + 750ms = %d",
 				 ret);

@@ -172,11 +172,20 @@ static enum drm_connector_status fl2000_connector_detect(struct drm_connector *c
 	if (!fl2000_i2c_dword(drm_if->usb_dev, true, FL2000_DDC_ADDR, 0, &header))
 		return connector_status_connected;
 
-	/* A DDC NAK does not prove absence: a monitor can be attached through a cable that
-	 * simply has no DDC wires. Unknown keeps the connector usable with the fallback modes
-	 * while still letting a real EDID upgrade it to connected when DDC works
+	/* A DDC NAK does not prove absence: this dongle NAKs the DDC EEPROM even with a
+	 * Windows-proven monitor attached and awake. The chip's analog sense register is the
+	 * reliable presence signal here (tracks physical cable attach/detach exactly), and a
+	 * desktop needs a definitive 'connected' to enable the output - compositors ignore
+	 * 'unknown'. Without EDID, get_modes() serves the VESA fallback list
 	 */
-	return connector_status_unknown;
+	switch (fl2000_connector_sense(drm_if->usb_dev)) {
+	case 1:
+		return connector_status_connected;
+	case 0:
+		return connector_status_disconnected;
+	default:
+		return connector_status_unknown;
+	}
 }
 
 static const struct drm_connector_helper_funcs fl2000_connector_helper_funcs = {

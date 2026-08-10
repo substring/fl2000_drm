@@ -345,6 +345,27 @@ void fl2000_dump_regs(struct usb_device *usb_dev)
 	}
 }
 
+/* Live connector presence sense. Register 0x805C is modelled by neither vendor driver but was
+ * found by raw-diffing chip state against physical cable changes (NOTES.md "Round 4"): it reads
+ * zero with the VGA cable detached and a nonzero analog-sense pattern (e.g. 0x00ffecbb) with a
+ * monitor attached, tracking the cable exactly and staying stable within a state. Read through
+ * the raw backend on purpose - the register is not in the regmap volatile list, so a regmap_read
+ * would return a stale cached value.
+ *
+ * Returns 1 if a sink is sensed, 0 if not, negative errno on transfer failure
+ */
+int fl2000_connector_sense(struct usb_device *usb_dev)
+{
+	unsigned int val = 0;
+	int ret;
+
+	ret = fl2000_reg_read(usb_dev, 0x805C, &val);
+	if (ret)
+		return ret;
+
+	return val != 0;
+}
+
 /* Round 5 experiments: values below are VERBATIM from the Windows USBPcap capture
  * (~/src/fl2000/win-capture.pcapng, NOTES.md "Round 5") of this exact dongle+monitor working.
  * Not decoded through our field unions on purpose - the point is replaying known-good state

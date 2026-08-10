@@ -175,6 +175,7 @@ int fl2000_set_transfers(struct usb_device *usb_dev);
 int fl2000_set_pixfmt(struct usb_device *usb_dev, u32 bytes_pix);
 int fl2000_set_timings(struct usb_device *usb_dev, struct fl2000_timings *timings);
 int fl2000_set_pll(struct usb_device *usb_dev, struct fl2000_pll *pll);
+int fl2000_connector_sense(struct usb_device *usb_dev);
 int fl2000_ddc_detect_enable_staged(struct usb_device *usb_dev);
 int fl2000_ddc_step_aclk(struct usb_device *usb_dev);
 int fl2000_ddc_step_modeset(struct usb_device *usb_dev);
