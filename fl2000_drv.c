@@ -26,6 +26,15 @@ MODULE_PARM_DESC(vga_mode,
 		 "IT66121 bridge chip, so the component match never completes and the display "
 		 "pipeline never comes up; set this to bring up a VGA connector instead");
 
+/* Cumulative DDC bring-up experiments for the probe_only loop, see NOTES.md "Round 3":
+ * 0 = baseline init; 1 = reference-order detect enable (EDID/I2C detect bit alone, 750 ms settle,
+ * then the rest); 2 = step 1 plus usb_set_interface(0, 1) first, the reference driver's
+ * workaround for FL2000's redundant-endpoint descriptors that kernels >= 5.x ignore
+ */
+static int fl2000_ddc_step;
+module_param_named(ddc_step, fl2000_ddc_step, int, 0444);
+MODULE_PARM_DESC(ddc_step, "Cumulative DDC bring-up steps 0-2 (default 0), see NOTES.md");
+
 bool fl2000_probe_only;
 module_param_named(probe_only, fl2000_probe_only, bool, 0444);
 MODULE_PARM_DESC(probe_only,
@@ -165,13 +174,30 @@ static int fl2000_probe(struct usb_interface *interface, const struct usb_device
 		 * I2C master and the monitor detect circuit are enabled by fl2000_usb_magic(), so
 		 * until this runs no EDID can be read over DDC
 		 */
+		if (fl2000_ddc_step >= 2) {
+			ret = usb_set_interface(usb_dev, 0, 1);
+			dev_info(&usb_dev->dev, "ddc_step2: usb_set_interface(0, 1) = %d", ret);
+		}
+
 		fl2000_reset(usb_dev);
+
+		if (fl2000_ddc_step >= 1) {
+			ret = fl2000_ddc_detect_enable_staged(usb_dev);
+			dev_info(&usb_dev->dev, "ddc_step1: staged detect enable + 750ms = %d",
+				 ret);
+		}
+
 		fl2000_usb_magic(usb_dev);
 
 		/* Stop short of DRM. The i2c adapter is live at this point, which is all that is
 		 * needed to exercise the chip's I2C master from userspace
 		 */
 		if (fl2000_probe_only) {
+			/* What does the chip's own monitor-detect circuit see? The reference
+			 * driver gates its EDID read on bit 0 of this register
+			 */
+			fl2000_log_vga_status(usb_dev);
+
 			dev_info(&usb_dev->dev,
 				 "probe_only: I2C bus %d is live, no DRM device registered",
 				 i2c_adapter_id(devs->adapter));

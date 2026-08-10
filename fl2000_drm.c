@@ -139,6 +139,7 @@ static int fl2000_get_edid_block(void *data, u8 *buf, unsigned int block, size_t
 static int fl2000_connector_get_modes(struct drm_connector *connector)
 {
 	struct fl2000_drm_if *drm_if = container_of(connector, struct fl2000_drm_if, connector);
+	int count;
 
 	/* Re-read rather than cache: a VGA sink can be swapped without us being told */
 	drm_edid_free(drm_if->drm_edid);
@@ -146,7 +147,18 @@ static int fl2000_connector_get_modes(struct drm_connector *connector)
 
 	drm_edid_connector_update(connector, drm_if->drm_edid);
 
-	return drm_edid_connector_add_modes(connector);
+	if (drm_if->drm_edid)
+		return drm_edid_connector_add_modes(connector);
+
+	/* No EDID. VGA monitors without usable DDC are common (missing pins 12/15 in the cable,
+	 * adapters, gated chip paths), and are exactly why DRM carries standard fallback modes.
+	 * Offer VESA modes up to a conservative analog ceiling and prefer the old safe default;
+	 * the user can force something bigger explicitly
+	 */
+	count = drm_add_modes_noedid(connector, 1920, 1200);
+	drm_set_preferred_mode(connector, 1024, 768);
+
+	return count;
 }
 
 /* VGA has no hotplug detect line, so probe the sink by talking to its DDC EEPROM */
@@ -157,10 +169,14 @@ static enum drm_connector_status fl2000_connector_detect(struct drm_connector *c
 
 	UNUSED(force);
 
-	if (fl2000_i2c_dword(drm_if->usb_dev, true, FL2000_DDC_ADDR, 0, &header))
-		return connector_status_disconnected;
+	if (!fl2000_i2c_dword(drm_if->usb_dev, true, FL2000_DDC_ADDR, 0, &header))
+		return connector_status_connected;
 
-	return connector_status_connected;
+	/* A DDC NAK does not prove absence: a monitor can be attached through a cable that
+	 * simply has no DDC wires. Unknown keeps the connector usable with the fallback modes
+	 * while still letting a real EDID upgrade it to connected when DDC works
+	 */
+	return connector_status_unknown;
 }
 
 static const struct drm_connector_helper_funcs fl2000_connector_helper_funcs = {

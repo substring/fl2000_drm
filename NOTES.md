@@ -345,6 +345,77 @@ with the same code path. The remaining suspects are all outside the driver:
 - A dongle that does not wire the VGA connector's DDC pins to the chip's I2C
   master at all. Some low-cost FL2000 VGA dongles skip this.
 
+## Round 3 prep — hunting the missing DDC enable
+
+New fact from the user: dongle + monitor + cable work perfectly on Windows,
+including detection by name at native resolution. EDID therefore works
+end-to-end on this exact hardware. The 0x50 NAK is not physical; the Windows
+driver performs some enable that our probe_only init does not, i.e. the DDC
+path to the connector is gated at the chip level.
+
+### Reference driver: every HW touch before its first EDID access
+
+Traced through `fl2000_module.c` → `fl2000_dev_init()` (fl2000_dev.c) →
+`fl2000_dongle_card_initialize()` (fl2000_dongle.c) →
+`fl2000_monitor_manual_check_connection()` → `fl2000_monitor_vga_status_handler()`
+→ `fl2000_monitor_plugin_handler()` → `fl2000_monitor_read_edid_dsub()`.
+In order, on the VGA (no ITE chip) path:
+
+| # | Reference action | In our probe_only? |
+|---|---|---|
+| 1 | `usb_set_interface(if 0, alt 1)` — workaround for FL2000's buggy descriptors; kernels ≥5.x ignore the redundant endpoints unless alt 1 is selected | **MISSING** |
+| 2 | `0x0070` set bit 19, set bit 20 (reject U1/U2) | yes — `usb_magic()` `u1_reject`/`u2_reject` |
+| 3 | `0x8048` set bit 15 (app reset, self-clear) | yes — `fl2000_reset()` `sw_reset` bit 15, +10 ms |
+| 4 | I2C probes at 0x4C (`fl2000_hdmi_find_chip`) — NAK on a VGA dongle | skipped; harmless |
+| 5 | `0x8020` set bit 30 **alone**, then `msleep(750)` (`DELAY_FOR_I2C_CONNECTION_ENABLE`) | **PARTIAL** — bit is written, but combined with bit 28 in one write, and no delay |
+| 6 | `0x8020` set bit 28 (ext monitor detect enable) | yes — same combined write |
+| 7 | `0x8088` clear bit 10 ("turn off hardware reset") | yes — `usb_magic()` `wakeup_clr_en = 0` (klogg's `FL2000_VGA_CTRL_REG_3` *is* 0x8088) |
+| 8 | Read `0x8000`; proceed to EDID **only if** bit 0 `connected` is set | **MISSING** — we never read 0x8000 |
+| 9 | `0x0078` clear bit 17 | yes — `usb_magic()` `wake_nrdy = 0` |
+| 10 | `0x0070` reject U1/U2 again | yes (idempotent) |
+| 11 | dword EDID reads at 0x50, offsets 0,4,8..., 10 ms apart | equivalent to our reads |
+
+Two candidates initially suspected are in fact already covered: 0x8088 bit 10
+and 0x0078 bit 17 are both cleared by `usb_magic()` (the 0x8088 grep miss was
+because klogg computes the offset as `0x8000 + 0x88`).
+
+Genuinely missing, in suspicion order:
+
+- **A. Detect-enable sequencing (row 5):** reference sets the EDID/I2C detect
+  bit *by itself*, waits 750 ms for the detection circuit to settle, and only
+  then enables external monitor detect. We slam both bits in one write with no
+  settle time. Note the elapsed-time argument cuts both ways: our manual
+  rescans ran *minutes* after insmod and still NAKed, so a pure "wait 750 ms
+  after enable" cannot be the whole story — but "bit 30 must be enabled alone
+  before bit 28 joins" would not be cured by elapsed time.
+- **B. `usb_set_interface(0, 1)` (row 1):** a USB-level SET_INTERFACE the
+  chip's firmware observes, performed before any register work. If the
+  firmware keys internal power/routing off the altsetting, no amount of
+  register poking fixes it.
+- **C. `0x8000` gating (row 8):** the reference never even attempts EDID until
+  the chip's own monitor-detect circuit reports `connected` (bit 0). If the
+  DDC pads are powered by that circuit, a chip that thinks no monitor is
+  present may hold DDC dead. Reading 0x8000 costs nothing and adjudicates:
+  bits of interest are 0 `connected`, 28 `edid_connected`, 29
+  `ext_mon_connected`, 6 `pll_powered_up`, 7 `dac_powered_up` (reference
+  `struct vga_status`, fl2000_interrupt.h).
+
+Also checked and ruled out: the reference does **no** PLL/DAC/output-stage init
+before its first EDID read — `fl2000_dongle_set_params()` runs much later. So
+"DDC needs the output stage powered" is not supported by the reference code.
+
+### Round 3 mechanism
+
+`ddc_step` module param (int, cumulative), iterated via the probe_only loop:
+
+    ddc_step=0   baseline, current behaviour
+    ddc_step=1   A: set 0x8020 bit 30 alone, msleep(750), then usual init
+    ddc_step=2   A+B: usb_set_interface(0, 1) first, then step 1
+
+probe_only now always ends by reading `0x8000` and logging the decoded
+monitor-detect status (C), so each step's rescan also shows what the chip
+thinks is connected.
+
 ## Debugging notes
 
 - regmap debugfs exists at `/sys/kernel/debug/regmap/2-4/` but is of limited

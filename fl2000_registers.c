@@ -270,6 +270,51 @@ int fl2000_usb_magic(struct usb_device *usb_dev)
 	return 0;
 }
 
+/* Reference-order detect enable (FrescoLogic fl2000_dongle_i2c_detection_enable): the EDID/I2C
+ * detection circuit is switched on by itself and given 750 ms to settle before external monitor
+ * detect joins in usb_magic(). Our usual init writes both bits in one shot with no settle time
+ */
+int fl2000_ddc_detect_enable_staged(struct usb_device *usb_dev)
+{
+	struct regmap *regmap = dev_get_regmap(&usb_dev->dev, NULL);
+	union fl2000_vga_i2c_sc_reg reg = { .val = 0 };
+	u32 mask = 0;
+	int ret;
+
+	reg.edid_detect = true;
+	fl2000_add_bitmask(mask, union fl2000_vga_i2c_sc_reg, edid_detect);
+	ret = regmap_write_bits(regmap, FL2000_VGA_I2C_SC_REG, mask, reg.val);
+	if (ret)
+		return ret;
+
+	/* DELAY_FOR_I2C_CONNECTION_ENABLE in the reference driver */
+	msleep(750);
+
+	return 0;
+}
+
+/* Read and decode the chip's own idea of what is connected. Field names follow the reference
+ * driver's struct vga_status (fl2000_interrupt.h); bit 0 is the overall connect status that
+ * gates the reference driver's EDID read
+ */
+void fl2000_log_vga_status(struct usb_device *usb_dev)
+{
+	struct regmap *regmap = dev_get_regmap(&usb_dev->dev, NULL);
+	union fl2000_vga_status_reg status;
+	int ret;
+
+	ret = regmap_read(regmap, FL2000_VGA_STATUS_REG, &status.val);
+	if (ret) {
+		dev_err(&usb_dev->dev, "VGA status read failed (%d)", ret);
+		return;
+	}
+
+	dev_info(&usb_dev->dev,
+		 "VGA status 0x%08x: connected %u edid_connected %u ext_mon_connected %u pll_up %u dac_up %u",
+		 status.val, status.vga_status, status.edid_status, status.monitor_status,
+		 status.pll_status, status.dac_status);
+}
+
 int fl2000_enable_interrupts(struct usb_device *usb_dev)
 {
 	struct regmap *regmap = dev_get_regmap(&usb_dev->dev, NULL);
@@ -396,13 +441,17 @@ int fl2000_i2c_dword(struct usb_device *usb_dev, bool read, u16 addr, u8 offset,
 		return -EIO;
 	}
 
-	/* Deliberately not failing on a nonzero i2c_status. The Fresco Logic driver waits only for
-	 * the done bit and never inspects the per-byte status nibble, so treating it as fatal
-	 * rejected transfers that the reference implementation accepts
+	/* The full-bus scan in NOTES.md ("Round 2") proved i2c_status is a reliable per-byte
+	 * ACK/NAK indicator on this hardware: clean 0x0 on the one device that answers, 0xF on
+	 * the 111 that do not. So treat NAK as the failure it is - detect() depends on exactly
+	 * this signal, and letting NAKed reads through only returns bus garbage (0xf1). The
+	 * reference driver ignores the nibble and waits only on done; it is the sloppy one here
 	 */
-	if (reg.i2c_status)
-		dev_dbg(&usb_dev->dev, "i2c %s addr 0x%02x off 0x%02x: status 0x%x, continuing",
+	if (reg.i2c_status) {
+		dev_dbg(&usb_dev->dev, "i2c %s addr 0x%02x off 0x%02x: NAK (status 0x%x)",
 			read ? "rd" : "wr", addr, offset, reg.i2c_status);
+		return -EIO;
+	}
 
 	dev_dbg(&usb_dev->dev, "i2c %s addr 0x%02x off 0x%02x ok: post 0x%08x", read ? "rd" : "wr",
 		addr, offset, reg.val);
