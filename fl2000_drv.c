@@ -26,6 +26,14 @@ MODULE_PARM_DESC(vga_mode,
 		 "IT66121 bridge chip, so the component match never completes and the display "
 		 "pipeline never comes up; set this to bring up a VGA connector instead");
 
+bool fl2000_probe_only;
+module_param_named(probe_only, fl2000_probe_only, bool, 0444);
+MODULE_PARM_DESC(probe_only,
+		 "Bring up USB, regmap and the I2C adapter but register no DRM device (default 0). "
+		 "Without a card there is nothing for a compositor to open, so the module refcount "
+		 "stays at zero and rmmod/insmod can be iterated freely. Intended for poking the "
+		 "chip's I2C master with i2c-tools while debugging DDC");
+
 static struct usb_device_id fl2000_id_table[] = {
 	{ USB_DEVICE_INTERFACE_CLASS(USB_VENDOR_FRESCO_LOGIC, USB_PRODUCT_FL2000, USB_CLASS_AV) },
 	{},
@@ -159,6 +167,16 @@ static int fl2000_probe(struct usb_interface *interface, const struct usb_device
 		 */
 		fl2000_reset(usb_dev);
 		fl2000_usb_magic(usb_dev);
+
+		/* Stop short of DRM. The i2c adapter is live at this point, which is all that is
+		 * needed to exercise the chip's I2C master from userspace
+		 */
+		if (fl2000_probe_only) {
+			dev_info(&usb_dev->dev,
+				 "probe_only: I2C bus %d is live, no DRM device registered",
+				 i2c_adapter_id(devs->adapter));
+			return 0;
+		}
 
 		if (fl2000_vga_mode) {
 			/* Nothing to wait for: a VGA dongle has no bridge chip, so bind the DRM

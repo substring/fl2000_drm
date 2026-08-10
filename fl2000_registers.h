@@ -172,7 +172,16 @@ union fl2000_vga_i2c_sc_reg {
 		u32 i2c_addr	   : 7;
 		u32 i2c_cmd	   : 1;
 		u32 i2c_offset	   : 8;
-		u32 vga_status	   : 8;
+		/* Bits 16 and 17 were modelled as part of an unused 8-bit 'vga_status' field, so they
+		 * were never included in any write mask and regmap_write_bits() preserved whatever
+		 * the hardware happened to hold. The Fresco Logic driver's own register definition
+		 * (fl2000_i2c.h, union _I2C_DATA_) names them, and clears both on every transfer:
+		 * with bit 16 set the controller runs the operation against SPI instead of the
+		 * EEPROM, so a DDC read never reaches the monitor
+		 */
+		u32 i2c_spi_op	   : 1; /* 1 = SPI, 0 = EEPROM/I2C */
+		u32 i2c_spi_erase  : 1;
+		u32 __reserved_18  : 6;
 		u32 i2c_status	   : 4;
 		u32 monitor_detect : 1;
 		u32 i2c_ready	   : 1;

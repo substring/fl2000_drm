@@ -349,6 +349,15 @@ int fl2000_i2c_dword(struct usb_device *usb_dev, bool read, u16 addr, u8 offset,
 	reg.edid_detect = true;
 	fl2000_add_bitmask(mask, union fl2000_vga_i2c_sc_reg, edid_detect);
 
+	/* Force an EEPROM (I2C) operation. These bits are not self-clearing and were previously
+	 * left untouched by the write mask, so a stale SPI selection would silently divert every
+	 * transfer away from the DDC bus. The reference driver clears both on every transfer
+	 */
+	reg.i2c_spi_op = false;
+	fl2000_add_bitmask(mask, union fl2000_vga_i2c_sc_reg, i2c_spi_op);
+	reg.i2c_spi_erase = false;
+	fl2000_add_bitmask(mask, union fl2000_vga_i2c_sc_reg, i2c_spi_erase);
+
 	reg.i2c_status = 0;
 	fl2000_add_bitmask(mask, union fl2000_vga_i2c_sc_reg, i2c_status);
 	reg.i2c_addr = addr;
@@ -360,6 +369,15 @@ int fl2000_i2c_dword(struct usb_device *usb_dev, bool read, u16 addr, u8 offset,
 	reg.i2c_done = false;
 	fl2000_add_bitmask(mask, union fl2000_vga_i2c_sc_reg, i2c_done);
 
+	{
+		u32 before = 0;
+
+		regmap_read(regmap, FL2000_VGA_I2C_SC_REG, &before);
+		dev_dbg(&usb_dev->dev,
+			"i2c %s addr 0x%02x off 0x%02x: pre 0x%08x mask 0x%08x val 0x%08x",
+			read ? "rd" : "wr", addr, offset, before, mask, reg.val);
+	}
+
 	ret = regmap_write_bits(regmap, FL2000_VGA_I2C_SC_REG, mask, reg.val);
 	if (ret)
 		return -EIO;
@@ -370,8 +388,24 @@ int fl2000_i2c_dword(struct usb_device *usb_dev, bool read, u16 addr, u8 offset,
 	 * USB must be always available so no I/O errors. But if it happens we are probably in
 	 * irreversible HW issue
 	 */
-	if (ret || reg.i2c_status != 0)
+	if (ret) {
+		dev_err(&usb_dev->dev,
+			"i2c %s addr 0x%02x off 0x%02x timed out: post 0x%08x (done %u status 0x%x ready %u mon_det %u edid_det %u)",
+			read ? "rd" : "wr", addr, offset, reg.val, reg.i2c_done, reg.i2c_status,
+			reg.i2c_ready, reg.monitor_detect, reg.edid_detect);
 		return -EIO;
+	}
+
+	/* Deliberately not failing on a nonzero i2c_status. The Fresco Logic driver waits only for
+	 * the done bit and never inspects the per-byte status nibble, so treating it as fatal
+	 * rejected transfers that the reference implementation accepts
+	 */
+	if (reg.i2c_status)
+		dev_dbg(&usb_dev->dev, "i2c %s addr 0x%02x off 0x%02x: status 0x%x, continuing",
+			read ? "rd" : "wr", addr, offset, reg.i2c_status);
+
+	dev_dbg(&usb_dev->dev, "i2c %s addr 0x%02x off 0x%02x ok: post 0x%08x", read ? "rd" : "wr",
+		addr, offset, reg.val);
 
 	if (read) {
 		ret = regmap_read(regmap, FL2000_VGA_I2C_RD_REG, data);
