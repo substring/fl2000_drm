@@ -40,7 +40,7 @@ struct it66121_priv {
 
 	struct hdmi_avi_infoframe hdmi_avi_infoframe;
 
-	struct edid *edid;
+	const struct drm_edid *drm_edid;
 	bool dvi_mode;
 };
 
@@ -311,8 +311,8 @@ static void it66121_intr_work(struct work_struct *work_item)
 			it66121_is_hpd_detect(priv);
 			event = true;
 			if (priv->conn_status == connector_status_disconnected) {
-				kfree(priv->edid);
-				priv->edid = NULL;
+				drm_edid_free(priv->drm_edid);
+				priv->drm_edid = NULL;
 			}
 		}
 
@@ -399,24 +399,25 @@ static int it66121_get_edid_block(void *context, u8 *buf, unsigned int block, si
 static int it66121_connector_get_modes(struct drm_connector *connector)
 {
 	struct it66121_priv *priv = container_of(connector, struct it66121_priv, connector);
-	struct edid *edid = priv->edid;
 
-	if (!edid) {
-		edid = drm_do_get_edid(connector, it66121_get_edid_block, priv);
-		if (!edid)
+	if (!priv->drm_edid) {
+		priv->drm_edid = drm_edid_read_custom(connector, it66121_get_edid_block, priv);
+		if (!priv->drm_edid)
 			return 0;
-
-		drm_connector_update_edid_property(connector, edid);
-
-		priv->dvi_mode = !drm_detect_hdmi_monitor(edid);
-		priv->edid = edid;
 	}
 
-	return drm_add_edid_modes(connector, edid);
+	/* Updates the connector's EDID property and its display info, which is what
+	 * tells us whether the sink is HDMI or plain DVI
+	 */
+	drm_edid_connector_update(connector, priv->drm_edid);
+
+	priv->dvi_mode = !connector->display_info.is_hdmi;
+
+	return drm_edid_connector_add_modes(connector);
 }
 
 static enum drm_mode_status it66121_connector_mode_valid(struct drm_connector *connector,
-							 struct drm_display_mode *mode)
+							 const struct drm_display_mode *mode)
 {
 	/* TODO: validate mode */
 	UNUSED(connector);
@@ -486,7 +487,8 @@ static const struct component_ops it66121_component_ops = {
 };
 
 /* TODO: rewrite register access properly, add error processing */
-static int it66121_bridge_attach(struct drm_bridge *bridge, enum drm_bridge_attach_flags flags)
+static int it66121_bridge_attach(struct drm_bridge *bridge, struct drm_encoder *encoder,
+				 enum drm_bridge_attach_flags flags)
 {
 	int ret;
 	struct it66121_priv *priv = container_of(bridge, struct it66121_priv, bridge);
@@ -496,7 +498,7 @@ static int it66121_bridge_attach(struct drm_bridge *bridge, enum drm_bridge_atta
 		return -ENODEV;
 	}
 
-	if (!bridge->encoder) {
+	if (!encoder) {
 		DRM_ERROR("Parent encoder object not found");
 		return -ENODEV;
 	}
@@ -842,7 +844,7 @@ static void __exit it66121_remove(void)
 
 	component_del(&priv->client->dev, &it66121_component_ops);
 
-	kfree(priv->edid);
+	drm_edid_free(priv->drm_edid);
 
 	drm_bridge_remove(&priv->bridge);
 
