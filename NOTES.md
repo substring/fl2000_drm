@@ -261,6 +261,90 @@ Tip: load with `insmod ./fl2000.ko dyndbg=+p` to get dev_dbg output from the
 very start of probe. Enabling dynamic debug afterwards via
 `/sys/kernel/debug/dynamic_debug/control` is too late to catch probe.
 
+## Round 2 — raw DDC over the chip's I2C master (probe_only)
+
+Built from "Add probe_only, force EEPROM ops, stop failing on i2c_status".
+`insmod ./fl2000.ko probe_only=1 dyndbg=+p` gives i2c-8 live, refcount 0, no
+DRM device — so rmmod/insmod iterates freely with no compositor involvement.
+
+### Bit 16 verdict: NOT set at power-up. The SPI theory is wrong.
+
+First transfer after load, address 0x50 offset 0x00:
+
+    usb 2-4: i2c rd addr 0x50 off 0x00: pre 0xcf0000d0 mask 0xdf03ffff val 0x500000d0
+    usb 2-4: i2c rd addr 0x50 off 0x00: status 0xf, continuing
+    usb 2-4: i2c rd addr 0x50 off 0x00 ok: post 0xcf0000d0
+
+Decoding `pre = 0xcf0000d0`, bits 16-23 are `0x00`, so **`i2c_spi_op` (bit 16)
+and `i2c_spi_erase` (bit 17) were already clear**. Transfers were never being
+diverted to SPI. Clearing them explicitly is still correct (they are control
+bits that were in no write mask, so the old code depended on luck), but it was
+not the cause of the DDC failure.
+
+`mask = 0xdf03ffff` confirms bits 16/17 are now covered, and `val` has them
+clear, so the fix does what it claims.
+
+Other fields of `pre`/`post = 0xcf0000d0`:
+
+    i2c_status     bits 24-27 = 0xF   all four bytes failed (1 = failed per byte)
+    monitor_detect bit 28     = 0     reads back 0 even though we just wrote 1
+    i2c_ready      bit 29     = 0
+    edid_detect    bit 30     = 1
+    i2c_done       bit 31     = 1     transfer completed
+
+`monitor_detect` reading back as 0 is expected, not a fault: the Fresco Logic
+driver has the same behaviour and comments on it at `fl2000_i2c.c`, forcing the
+bit on every read with `read_back_data |= 0x10000000` under "BUG: Bit 28 always
+return zero."
+
+### The I2C master works. 0x50 is a genuine NAK.
+
+Full bus scan, addresses 0x08-0x77 (112 addresses), one single-byte read each:
+
+    111 addresses NAK   post = 0xcf0000xx, i2c_status = 0xF
+      1 address  ACKs   0x30, post = 0xc00000b0, i2c_status = 0x0
+
+0x30 is not a fluke. It answers at multiple offsets, always with status 0, and
+returns varying data rather than a constant:
+
+    0x30 off 0x00 -> 0x08    post 0xc00000b0
+    0x30 off 0x04 -> 0x92    post 0xc00004b0
+    0x30 off 0x08 -> 0x00    post 0xc00008b0
+    0x30 off 0x10 -> 0x00    post 0xc00010b0
+
+So the controller can address a device, clock a transfer and collect an ACK.
+Register programming, address handling and offset handling are all correct.
+The failure at 0x50 is the monitor's DDC EEPROM not answering, not a driver
+bug. Reads at 0x50 return a constant `0xf1`, which is stale/garbage from
+`FL2000_VGA_I2C_RD_REG` rather than sink data.
+
+Note 0x30 sits on the dongle's own I2C, ahead of the VGA connector — probably a
+configuration EEPROM. It is not the sink.
+
+### Consequence: i2c_status is meaningful after all
+
+The relaxation of the `i2c_status` check in this commit was justified by the
+reference driver, which waits only on the done bit and never inspects the
+status nibble. The scan shows that was the wrong lesson to draw: `i2c_status`
+is a clean, reliable ACK/NAK signal on this hardware — 0x0 on the one device
+that answers, 0xF on all 111 that do not. klogg's original hard check was
+right and the reference driver is the sloppy one here.
+
+The check should be restored once DDC works, because `detect()` needs exactly
+this signal to tell connected from disconnected. Leaving it relaxed means EDID
+reads return garbage that only gets caught later by header/checksum validation.
+
+### Where this leaves us
+
+Nothing in the driver explains a NAK at 0x50 while 0x30 ACKs on the same bus
+with the same code path. The remaining suspects are all outside the driver:
+
+- VGA cable with no DDC wiring. Pins 12 (SDA) and 15 (SCL) are omitted on many
+  cheap or older VGA cables, and on most VGA-to-DVI adapters.
+- Monitor in a standby state deep enough to unpower its EDID EEPROM.
+- A dongle that does not wire the VGA connector's DDC pins to the chip's I2C
+  master at all. Some low-cost FL2000 VGA dongles skip this.
+
 ## Debugging notes
 
 - regmap debugfs exists at `/sys/kernel/debug/regmap/2-4/` but is of limited
