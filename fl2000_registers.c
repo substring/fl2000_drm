@@ -315,6 +315,36 @@ void fl2000_log_vga_status(struct usb_device *usb_dev)
 		 status.pll_status, status.dac_status);
 }
 
+/* Raw dump of the VGA register block plus the two USB-block registers the drivers touch. Uses
+ * the usb_control_msg backend directly, NOT regmap_read: most of these registers are cached by
+ * regmap, and a cached read would show our writes rather than the hardware's live state. Meant
+ * for diffing chip state against a physical change (cable attached vs detached) to locate live
+ * detect/status bits without trusting either driver's struct layouts
+ */
+void fl2000_dump_regs(struct usb_device *usb_dev)
+{
+	static const u16 usb_regs[] = { 0x0070, 0x0078 };
+	unsigned int val;
+	u16 reg;
+
+	for (int i = 0; i < ARRAY_SIZE(usb_regs); i++) {
+		if (fl2000_reg_read(usb_dev, usb_regs[i], &val))
+			continue;
+		dev_info(&usb_dev->dev, "regdump %04x: %08x", usb_regs[i], val);
+	}
+
+	for (reg = 0x8000; reg < 0x8100; reg += 16) {
+		unsigned int v[4] = { 0 };
+
+		for (int i = 0; i < 4; i++)
+			if (fl2000_reg_read(usb_dev, reg + i * 4, &v[i]))
+				v[i] = 0xdeaddead;
+
+		dev_info(&usb_dev->dev, "regdump %04x: %08x %08x %08x %08x", reg, v[0], v[1],
+			 v[2], v[3]);
+	}
+}
+
 int fl2000_enable_interrupts(struct usb_device *usb_dev)
 {
 	struct regmap *regmap = dev_get_regmap(&usb_dev->dev, NULL);

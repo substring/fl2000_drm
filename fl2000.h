@@ -177,6 +177,7 @@ int fl2000_set_timings(struct usb_device *usb_dev, struct fl2000_timings *timing
 int fl2000_set_pll(struct usb_device *usb_dev, struct fl2000_pll *pll);
 int fl2000_ddc_detect_enable_staged(struct usb_device *usb_dev);
 void fl2000_log_vga_status(struct usb_device *usb_dev);
+void fl2000_dump_regs(struct usb_device *usb_dev);
 int fl2000_enable_interrupts(struct usb_device *usb_dev);
 int fl2000_check_interrupt(struct usb_device *usb_dev);
 int fl2000_i2c_dword(struct usb_device *usb_dev, bool read, u16 addr, u8 offset, u32 *data);

@@ -472,6 +472,70 @@ seconds. If it ACKs, the "fix" is behavioural, not register-level: the driver
 should retry EDID after enabling video output, and the EDID-less fallback
 carries the first modeset.
 
+## Round 4 — cable diffing: the chip does watch the connector, in a register nobody models
+
+Physical tests run with the user's help, probe_only loop throughout.
+
+### VGA cable detached at the dongle
+
+- 0x30 still ACKs (`0x08`) → the device at 0x30 is **dongle-internal** (config
+  EEPROM, most likely). The E-DDC segment pointer theory is dead.
+- `0x8000` reads **bit-identical** to the attached state (`0x200000c1`,
+  connected=1, ext_mon=1) → those bits are static under our init and do NOT
+  track the connector. The earlier inference "the chip sees the monitor" was
+  wrong; whatever those bits mean, they are not live presence.
+
+### Monitor awake test
+
+Cable re-attached, monitor powered on and actively showing its "Check Cable
+Connection" OSD — the most DDC-favourable state possible. 0x50 still NAKs.
+**The deep-standby theory is dead.**
+
+### Raw register diff (dump_regs=1), cable attached vs detached
+
+Full raw dump of 0x8000-0x80FF plus 0x0070/0x0078, bypassing the regmap cache
+(usb_control_msg backend directly). Two dumps per state to separate counters
+from state:
+
+    0x8040  changes between same-state dumps          -> free-running counter, ignore
+    0x805C  stable within state, tracks cable exactly:
+                detached: 0x00000000
+                attached: 0x00ffecbb
+
+**0x805C is a live connector-tracking register modelled by neither driver.**
+Byte pattern ff/ec/bb looks like three analog sense readings — plausibly the
+raw output of the load-detect block on the RGB lines. So the detection
+hardware is alive and the connector is electrically visible to the chip; only
+the DDC/EDID side stays dead. (0x8024 = f1f1f1f1 in the dumps also confirms
+0xf1 was fill garbage in the I2C read register, as suspected.)
+
+### Where this converges: DDC +5V (VGA pin 9)
+
+Facts now established simultaneously:
+- I2C engine works (0x30 ACKs, structured data)
+- analog sense path works (0x805C tracks the cable)
+- monitor is awake and Windows-proven on this exact chain
+- EEPROM at 0x50 NAKs, and the chip's own EDID-detect agrees
+
+The one element that would produce exactly this split is the **DDC +5V supply**
+on VGA pin 9: the host powers the monitor's EDID EEPROM through it (that is
+why EDID normally works even on an unpowered monitor — and conversely, a
+monitor whose EEPROM expects pin-9 power will NAK even when awake if pin 9 is
+dead). If the dongle gates +5V through a FET on an FL2000 GPIO which the
+Windows driver sets, everything observed fits. Neither Linux driver contains
+the string "gpio"; the FL2000's GPIO registers are in space neither driver
+touches, so the enable cannot be found by reading their code.
+
+### Next: Windows USB capture (decisive)
+
+All software candidates derivable from the two Linux codebases are exhausted.
+The Windows driver demonstrably performs the missing enable, and every
+register access it makes is visible on the wire as a vendor control transfer
+(bRequest 64 = read, 65 = write, register offset in wIndex, 4-byte value).
+A USBPcap/Wireshark capture on the Windows machine from dongle plug-in to
+desktop-on-VGA contains, by construction, the complete working init sequence.
+Diffing its writes against ours is a mechanical lookup that ends the guessing.
+
 ## Debugging notes
 
 - regmap debugfs exists at `/sys/kernel/debug/regmap/2-4/` but is of limited

@@ -35,6 +35,11 @@ static int fl2000_ddc_step;
 module_param_named(ddc_step, fl2000_ddc_step, int, 0444);
 MODULE_PARM_DESC(ddc_step, "Cumulative DDC bring-up steps 0-2 (default 0), see NOTES.md");
 
+/* Raw-dump the register space at the end of probe (probe_only aid, see NOTES.md) */
+static bool fl2000_dump;
+module_param_named(dump_regs, fl2000_dump, bool, 0444);
+MODULE_PARM_DESC(dump_regs, "Dump raw register space after probe init (default 0)");
+
 bool fl2000_probe_only;
 module_param_named(probe_only, fl2000_probe_only, bool, 0444);
 MODULE_PARM_DESC(probe_only,
@@ -197,6 +202,9 @@ static int fl2000_probe(struct usb_interface *interface, const struct usb_device
 			 * driver gates its EDID read on bit 0 of this register
 			 */
 			fl2000_log_vga_status(usb_dev);
+
+			if (fl2000_dump)
+				fl2000_dump_regs(usb_dev);
 
 			dev_info(&usb_dev->dev,
 				 "probe_only: I2C bus %d is live, no DRM device registered",
