@@ -101,6 +101,8 @@ static inline int fl2000_urb_status(struct usb_device *usb_dev, int status, int 
 	int ret = status;
 
 	switch (status) {
+	case 0: /* Success - not an error, do not log it as one */
+		break;
 	/* Stalled endpoint */
 	case -EPIPE:
 		ret = usb_clear_halt(usb_dev, pipe);
@@ -192,6 +194,9 @@ int fl2000_i2c_dword(struct usb_device *usb_dev, bool read, u16 addr, u8 offset,
  * Defined in fl2000_drv.c
  */
 extern bool fl2000_vga_mode;
+
+/* Diagnostic: stream solid white instead of framebuffer content. Defined in fl2000_drv.c */
+extern bool fl2000_test_fill;
 
 /* DRM device creation */
 int fl2000_drm_bind(struct device *master);

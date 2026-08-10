@@ -156,9 +156,11 @@ static void fl2000_stream_data_completion(struct urb *urb)
 	struct fl2000_stream *stream = urb->context;
 
 	if (stream) {
-		spin_lock_irq(&stream->list_lock);
+		unsigned long flags;
+
+		spin_lock_irqsave(&stream->list_lock, flags);
 		list_move_tail(&cur_sb->list, &stream->render_list);
-		spin_unlock(&stream->list_lock);
+		spin_unlock_irqrestore(&stream->list_lock, flags);
 
 		drm_crtc_handle_vblank(stream->crtc);
 
@@ -182,6 +184,8 @@ static void fl2000_stream_work(struct work_struct *work)
 	struct urb *data_urb;
 
 	while (stream->enabled) {
+		unsigned long flags;
+
 		ret = down_interruptible(&stream->work_sem);
 		if (ret) {
 			dev_err(&usb_dev->dev, "Work interrupt error %d", ret);
@@ -189,7 +193,7 @@ static void fl2000_stream_work(struct work_struct *work)
 			return;
 		}
 
-		spin_lock_irq(&stream->list_lock);
+		spin_lock_irqsave(&stream->list_lock, flags);
 
 		/* If no buffers are available for immediate transmission - then copy latest
 		 * transmission data
@@ -209,7 +213,7 @@ static void fl2000_stream_work(struct work_struct *work)
 						  list);
 		}
 		list_move_tail(&cur_sb->list, &stream->wait_list);
-		spin_unlock(&stream->list_lock);
+		spin_unlock_irqrestore(&stream->list_lock, flags);
 
 		data_urb = usb_alloc_urb(0, GFP_KERNEL);
 		if (!data_urb) {
@@ -264,32 +268,43 @@ void fl2000_stream_compress(struct fl2000_stream *stream, void *src, unsigned in
 	struct fl2000_stream_buf *cur_sb;
 	void *dst;
 	u32 dst_line_len;
+	unsigned long flags;
 
 	BUG_ON(list_empty(&stream->render_list));
 
-	spin_lock_irq(&stream->list_lock);
+	spin_lock_irqsave(&stream->list_lock, flags);
 
 	cur_sb = list_first_entry(&stream->render_list, struct fl2000_stream_buf, list);
 	dst = cur_sb->vaddr;
 	dst_line_len = width * stream->bytes_pix;
 
-	for (unsigned int y = 0; y < height; y++) {
-		switch (stream->bytes_pix) {
-		case 2:
-			fl2000_xrgb888_to_rgb565_line(dst, src, width);
-			break;
-		case 3:
-			fl2000_xrgb888_to_rgb888_line(dst, src, width);
-			break;
-		default: /* Shouldn't happen */
-			break;
+	if (fl2000_test_fill) {
+		/* Diagnostic: ignore the framebuffer and transmit solid white. The chip paces
+		 * bulk URBs at frame rate, so it demonstrably consumes what we send; a white
+		 * screen here proves the chip->DAC->monitor data path and isolates a black
+		 * screen to the framebuffer copy path, while a black screen with this set
+		 * means the chip is discarding/blanking pixel data internally
+		 */
+		memset(dst, 0xff, stream->buf_size);
+	} else {
+		for (unsigned int y = 0; y < height; y++) {
+			switch (stream->bytes_pix) {
+			case 2:
+				fl2000_xrgb888_to_rgb565_line(dst, src, width);
+				break;
+			case 3:
+				fl2000_xrgb888_to_rgb888_line(dst, src, width);
+				break;
+			default: /* Shouldn't happen */
+				break;
+			}
+			src += pitch;
+			dst += dst_line_len;
 		}
-		src += pitch;
-		dst += dst_line_len;
 	}
 
 	list_move_tail(&cur_sb->list, &stream->transmit_list);
-	spin_unlock(&stream->list_lock);
+	spin_unlock_irqrestore(&stream->list_lock, flags);
 }
 
 int fl2000_stream_mode_set(struct fl2000_stream *stream, int pixels, u32 bytes_pix)

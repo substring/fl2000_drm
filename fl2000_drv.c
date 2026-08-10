@@ -41,6 +41,14 @@ static bool fl2000_dump;
 module_param_named(dump_regs, fl2000_dump, bool, 0444);
 MODULE_PARM_DESC(dump_regs, "Dump raw register space after probe init (default 0)");
 
+bool fl2000_test_fill;
+module_param_named(test_fill, fl2000_test_fill, bool, 0644);
+MODULE_PARM_DESC(test_fill,
+		 "Stream solid white instead of framebuffer content (default 0). Diagnostic for "
+		 "black-screen-with-locked-sync: white on screen proves the chip/DAC data path "
+		 "and isolates the fault to the framebuffer copy; still-black means the chip "
+		 "discards pixel data. Writable at runtime via /sys/module/fl2000/parameters");
+
 bool fl2000_probe_only;
 module_param_named(probe_only, fl2000_probe_only, bool, 0444);
 MODULE_PARM_DESC(probe_only,
