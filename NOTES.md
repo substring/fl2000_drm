@@ -213,6 +213,54 @@ driver, so it is not required.
 Conclusion: no register porting needed. The remaining risk for first picture is
 in PLL/timing selection and the streaming path, not DAC bring-up.
 
+## Round 1 — devres lifetime fix validated on hardware
+
+Run after a clean reboot, module built from commit "Fix devres lifetime...".
+Two full unload/reload cycles, no `vga_mode`. **Pass.**
+
+Baseline was `i2c-0`..`i2c-7` (amdgpu + i801), no fl2000.
+
+    insmod  -> i2c-8 = FL2000 bridge I2C bus     appears
+    rmmod   -> i2c-8 GONE                         <- the fix
+    insmod  -> i2c-8 recreated, full probe
+    rmmod   -> i2c-8 gone
+    insmod  -> i2c-8 recreated
+    rmmod   -> i2c-8 gone
+
+dmesg for the sequence (loaded with `dyndbg=+p`):
+
+    [ 254.848457] usb 2-4: Created FL2000 bridge I2C bus 8 at interface usb-0000:00:14.0-4
+    [ 254.861339] usbcore: registered new interface driver fl2000_usb
+    [ 273.006128] usbcore: deregistering interface driver fl2000_usb
+    [ 274.048528] usb 2-4: Created FL2000 bridge I2C bus 8 at interface usb-0000:00:14.0-4
+    [ 274.060010] usbcore: registered new interface driver fl2000_usb
+    [ 276.070107] usbcore: deregistering interface driver fl2000_usb
+
+Two things worth calling out as evidence, beyond "no crash":
+
+1. **The adapter actually disappears on rmmod.** Before the fix it stayed
+   registered with `->owner` pointing into freed module text, which is what
+   oopsed `try_module_get()` from `i2cdev_open()`.
+2. **`Created FL2000 bridge I2C bus 8` is printed again on every reload.** That
+   line lives in `fl2000_i2c_init()`, reachable only via
+   `fl2000_get_devices()`. Under the old bug the reload found a stale `devs` in
+   drvdata and skipped device creation entirely, so this line was absent and
+   the driver silently reused the dead adapter. Its reappearance is positive
+   proof of a genuine fresh probe rather than reuse.
+
+State afterwards: `fl2000` unloaded, no oops/BUG/Call Trace in dmesg (count 0),
+`/proc/sys/kernel/tainted` = 12288, i.e. exactly `TAINT_OOT_MODULE (4096)` +
+`TAINT_UNSIGNED_MODULE (8192)` and no crash bits.
+
+Note on D-state kworkers: a `kworker/u112:* events_unbound` flickers into D
+throughout, including at baseline *before* fl2000 was ever loaded, and it
+reports as `gfx_0.0.0` when idle. That is amdgpu background work, unrelated to
+this driver. Do not mistake it for the symptom seen in the oops session.
+
+Tip: load with `insmod ./fl2000.ko dyndbg=+p` to get dev_dbg output from the
+very start of probe. Enabling dynamic debug afterwards via
+`/sys/kernel/debug/dynamic_debug/control` is too late to catch probe.
+
 ## Debugging notes
 
 - regmap debugfs exists at `/sys/kernel/debug/regmap/2-4/` but is of limited
