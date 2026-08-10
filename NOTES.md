@@ -628,6 +628,46 @@ this monitor deleted (Device Manager → Monitors → uninstall device, or
 registry `HKLM\SYSTEM\CurrentControlSet\Enum\DISPLAY` entry removal) so
 Windows is forced to pull EDID over the wire.
 
+## Hot-unplug deadlock (found by accident, likely the real #12/#33)
+
+During Round 5 the dongle was physically unplugged and replugged while
+vga_mode was loaded and cosmic-comp held the DRM fd. The DRM teardown itself
+completed (card0 disappeared), but `fl2000_disconnect` then hung forever:
+
+    wait_for_completion
+    i2c_del_adapter+0x287
+    fl2000_i2c_cleanup
+    fl2000_disconnect
+    usb_unbind_interface
+    ...
+    hub_event            <- usb_hub_wq kworker, permanently D-state
+
+Hung-task dumps repeated every 120 s; USB hotplug processing on that bus was
+stalled from then on. Only a reboot clears it (and shutdown itself may stall
+on the D-state task — be ready to hard power off).
+
+Root cause is circular: the DRM device was devm-allocated on the **i2c
+adapter's** device, and `i2c_del_adapter()` waits for the adapter device's
+final release. With a compositor fd still open, the DRM device stays alive,
+its devres link keeps the adapter referenced, and the adapter release —
+which `i2c_del_adapter()` is waiting on — can never happen from inside the
+very disconnect that must finish first. A hot-unplug under any live DRM
+client therefore wedges the USB hub queue permanently. This matches the
+symptom class of klogg issues #12/#33 better than the devres-lifetime bug
+did.
+
+Fix: parent the VGA-mode DRM device on the AVCONTROL **usb_interface**
+instead. `device_del()` on an interface does not wait for lingering
+references, so the standard `drm_dev_unplug()` pattern (unplugged device
+lingers harmlessly until the last fd closes) works as designed, and
+`i2c_del_adapter()` no longer depends on the DRM device's lifetime.
+`fl2000_drm_bind()` is unchanged — it takes the usb_device from
+`master->parent`, which holds for an interface exactly as it did for the
+adapter.
+
+The component/HDMI path still uses the adapter as master and retains the
+deadlock; untestable here (no IT66121 hardware), noted for upstream.
+
 ## Debugging notes
 
 - regmap debugfs exists at `/sys/kernel/debug/regmap/2-4/` but is of limited

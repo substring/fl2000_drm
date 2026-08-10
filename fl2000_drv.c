@@ -63,6 +63,16 @@ struct fl2000_devs {
 	int active_if;
 	bool master_added;
 	bool drm_bound;
+
+	/* Device the VGA-mode DRM device is bound on: the AVCONTROL usb_interface. NOT the i2c
+	 * adapter: a devm DRM device parented on the adapter deadlocks disconnect, because
+	 * i2c_del_adapter() wait_for_completion()s on the adapter's final release while an open
+	 * compositor fd (plus the devres link itself) keeps the DRM device - and therefore the
+	 * adapter - referenced. Observed as a permanently hung usb_hub_wq on hot-unplug.
+	 * usb_interface device_del() has no such wait, so the standard drm_dev_unplug()
+	 * lingering-fd pattern works as intended
+	 */
+	struct device *drm_master;
 };
 
 static struct component_master_ops fl2000_master_ops = {
@@ -163,6 +173,8 @@ static int fl2000_probe(struct usb_interface *interface, const struct usb_device
 
 	switch (iface_num) {
 	case FL2000_USBIF_AVCONTROL:
+		devs->drm_master = &interface->dev;
+		fallthrough;
 	case FL2000_USBIF_STREAMING:
 	case FL2000_USBIF_INTERRUPT:
 		devs->active_if |= BIT(iface_num);
@@ -227,7 +239,7 @@ static int fl2000_probe(struct usb_interface *interface, const struct usb_device
 			 * device straight away rather than registering a component master that
 			 * would never be satisfied
 			 */
-			ret = fl2000_drm_bind(&devs->adapter->dev);
+			ret = fl2000_drm_bind(devs->drm_master);
 			if (ret) {
 				dev_err(&usb_dev->dev, "Cannot bind DRM device (%d)", ret);
 				return ret;
@@ -263,7 +275,7 @@ static void fl2000_disconnect(struct usb_interface *interface)
 	}
 
 	if (devs->drm_bound) {
-		fl2000_drm_unbind(&devs->adapter->dev);
+		fl2000_drm_unbind(devs->drm_master);
 		devs->drm_bound = false;
 	}
 
