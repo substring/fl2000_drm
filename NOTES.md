@@ -668,6 +668,45 @@ adapter.
 The component/HDMI path still uses the adapter as master and retains the
 deadlock; untestable here (no IT66121 hardware), noted for upstream.
 
+## FIRST PICTURE — desktop on the VGA monitor via COSMIC
+
+Sequence that got there, same boot, no TTY needed:
+
+- TTY run (previous boot): connector `connected` via the 0x805C sense detect,
+  modetest modeset gave locked sync + 60 fps chip-paced bulk URBs but a black
+  screen; DDC stayed NAKed while real frames streamed, killing the last
+  sync-dependent-DDC theory. Verdict: this dongle has no usable DDC path
+  (most plausibly pin-9 +5V unwired); Windows ran on cached EDID. The VESA
+  fallback modes are the permanent solution, not a stopgap.
+- Fixed: URB success logged as error (missing `case 0:`), and
+  `spin_lock_irq()`/`spin_unlock()` imbalances through the whole streaming
+  path (irqs left disabled on exit in process context; irq-disabling lock
+  taken in hard-irq context). Added runtime-writable `test_fill` diagnostic.
+- Loaded `vga_mode=1` under COSMIC: DRM device binds on usb interface
+  `2-4:1.0` (deadlock fix in effect), connector reports `connected`, and
+  **COSMIC auto-enabled the display with no manual step** — dmesg shows the
+  1024x768 modeset, and the desktop is visible on the monitor. The black
+  screen did not reproduce once the locking was fixed; `test_fill` was never
+  needed.
+
+State: EDID-less operation at 1024x768@60 preferred, VESA fallback list up to
+1680x1050 offered (1920x1200 ceiling; the mode_valid PLL/bandwidth filter
+trims the list). Resolution changeable from COSMIC Displays like any monitor.
+
+Remaining loose ends, in rough priority:
+- Controlled hot-unplug while the compositor is actively driving the output —
+  the interface-parenting fix makes this the designed drm_dev_unplug pattern,
+  but it has not been exercised deliberately since the fix.
+- rmmod under compositor remains impossible by design (open fds pin the
+  module); unload = unplug or reboot. Not a bug.
+- The component/HDMI (it66121) path kept the old adapter-parented master and
+  with it the disconnect deadlock; untestable without hardware, flagged for
+  upstream.
+- fbcon "Deferring console take-over" — fbdev emulation present but console
+  never takes over; harmless for desktop use.
+- The `^ 4` dword-swizzle in the RGB888 pack path is confirmed correct by the
+  working picture.
+
 ## Debugging notes
 
 - regmap debugfs exists at `/sys/kernel/debug/regmap/2-4/` but is of limited
