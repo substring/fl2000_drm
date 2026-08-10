@@ -31,6 +31,7 @@ struct fl2000_devs {
 	struct i2c_adapter *adapter;
 	struct component_match *match;
 	int active_if;
+	bool master_added;
 };
 
 static struct component_master_ops fl2000_master_ops = {
@@ -62,23 +63,48 @@ static struct fl2000_devs *fl2000_get_devices(struct usb_device *usb_dev)
 {
 	struct fl2000_devs *devs;
 
-	devs = devm_kzalloc(&usb_dev->dev, sizeof(*devs), GFP_KERNEL);
+	devs = kzalloc(sizeof(*devs), GFP_KERNEL);
 	if (!devs)
 		return (ERR_PTR(-ENOMEM));
 
 	devs->regmap = fl2000_regmap_init(usb_dev);
-	if (IS_ERR(devs->regmap))
-		return ERR_CAST(devs->regmap);
+	if (IS_ERR(devs->regmap)) {
+		struct regmap *regmap = devs->regmap;
+
+		kfree(devs);
+		return ERR_CAST(regmap);
+	}
 
 	devs->adapter = fl2000_i2c_init(usb_dev);
-	if (IS_ERR(devs->adapter))
-		return ERR_CAST(devs->adapter);
+	if (IS_ERR(devs->adapter)) {
+		struct i2c_adapter *adapter = devs->adapter;
+
+		fl2000_regmap_cleanup(devs->regmap);
+		kfree(devs);
+		return ERR_CAST(adapter);
+	}
 
 	component_match_add(&devs->adapter->dev, &devs->match, fl2000_compare, NULL);
 
 	dev_set_drvdata(&usb_dev->dev, devs);
 
 	return devs;
+}
+
+/* Tears down everything fl2000_get_devices() created. None of it is devres managed on
+ * &usb_dev->dev, because that is released only when the usb_device disappears - which outlives
+ * this module and left freed module text reachable through a registered i2c_adapter after rmmod
+ */
+static void fl2000_put_devices(struct usb_device *usb_dev, struct fl2000_devs *devs)
+{
+	/* Stop anyone finding a stale devs on the next probe */
+	dev_set_drvdata(&usb_dev->dev, NULL);
+
+	/* Drops the component match devres along with the adapter device */
+	fl2000_i2c_cleanup(devs->adapter);
+	fl2000_regmap_cleanup(devs->regmap);
+
+	kfree(devs);
 }
 
 /* TODO: Halt driver on initialization failure */
@@ -132,6 +158,7 @@ static int fl2000_probe(struct usb_interface *interface, const struct usb_device
 			dev_err(&usb_dev->dev, "Cannot register component master (%d)", ret);
 			return ret;
 		}
+		devs->master_added = true;
 	}
 
 	return ret;
@@ -146,8 +173,10 @@ static void fl2000_disconnect(struct usb_interface *interface)
 	if (!devs)
 		return;
 
-	if (devs->active_if == FL2000_ALL_IFS)
+	if (devs->master_added) {
 		component_master_del(&devs->adapter->dev, &fl2000_master_ops);
+		devs->master_added = false;
+	}
 
 	switch (iface_num) {
 	case FL2000_USBIF_AVCONTROL:
@@ -160,6 +189,12 @@ static void fl2000_disconnect(struct usb_interface *interface)
 		dev_warn(&interface->dev, "What interface %d?", iface_num);
 		break;
 	}
+
+	/* Once the last interface is gone nothing can reach the chip any more, so drop the shared
+	 * resources. Doing this here rather than leaving it to devres is what makes rmmod safe
+	 */
+	if (!devs->active_if)
+		fl2000_put_devices(usb_dev, devs);
 }
 
 static int fl2000_suspend(struct usb_interface *interface, pm_message_t message)

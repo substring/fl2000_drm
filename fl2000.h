@@ -160,9 +160,11 @@ void fl2000_intr_destroy(struct usb_device *usb_dev);
 
 /* I2C adapter interface creation */
 struct i2c_adapter *fl2000_i2c_init(struct usb_device *usb_dev);
+void fl2000_i2c_cleanup(struct i2c_adapter *adapter);
 
 /* Register map creation */
 struct regmap *fl2000_regmap_init(struct usb_device *usb_dev);
+void fl2000_regmap_cleanup(struct regmap *regmap);
 
 /* Registers interface */
 int fl2000_reset(struct usb_device *usb_dev);

@@ -382,13 +382,23 @@ int fl2000_i2c_dword(struct usb_device *usb_dev, bool read, u16 addr, u8 offset,
 	return 0;
 }
 
+/* Not devm_ managed for the same reason as the i2c adapter: devres on &usb_dev->dev outlives this
+ * module, so the regmap (and its ops, which live in module text) would survive rmmod. Freed
+ * explicitly via fl2000_regmap_cleanup() from the disconnect path
+ */
 struct regmap *fl2000_regmap_init(struct usb_device *usb_dev)
 {
 	struct regmap *regmap;
 
-	regmap = devm_regmap_init(&usb_dev->dev, NULL, usb_dev, &fl2000_regmap_config);
+	regmap = regmap_init(&usb_dev->dev, NULL, usb_dev, &fl2000_regmap_config);
 	if (IS_ERR(regmap))
 		dev_err(&usb_dev->dev, "Registers map failed (%ld)", PTR_ERR(regmap));
 
 	return regmap;
+}
+
+void fl2000_regmap_cleanup(struct regmap *regmap)
+{
+	if (!IS_ERR_OR_NULL(regmap))
+		regmap_exit(regmap);
 }

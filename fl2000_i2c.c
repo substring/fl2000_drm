@@ -107,25 +107,21 @@ static const struct i2c_adapter_quirks fl2000_i2c_quirks = {
 	.max_comb_2nd_msg_len = I2C_REG_DATA_SIZE,
 };
 
-static void fl2000_i2c_adapter_release(struct device *dev, void *res)
-{
-	struct i2c_adapter *adapter = res;
-
-	dev_info(dev, "Releasing I2C adapter");
-	i2c_del_adapter(adapter);
-}
-
+/* NB: the adapter is deliberately NOT managed by devres on &usb_dev->dev. devres attached to the
+ * USB device is only released when the usb_device itself goes away, which outlives this module.
+ * On rmmod that left a registered i2c_adapter whose ->owner and ->algo pointed into freed module
+ * text, and the next open of the bus oopsed in try_module_get(). Ownership is explicit instead:
+ * fl2000_i2c_cleanup() is called from the disconnect path
+ */
 struct i2c_adapter *fl2000_i2c_init(struct usb_device *usb_dev)
 {
 	int ret;
 	struct i2c_adapter *adapter;
 	u8 usb_path[32];
 
-	/* Adapter must be allocated before anything else */
-	adapter = devres_alloc(fl2000_i2c_adapter_release, sizeof(*adapter), GFP_KERNEL);
+	adapter = kzalloc(sizeof(*adapter), GFP_KERNEL);
 	if (!adapter)
 		return ERR_PTR(-ENOMEM);
-	devres_add(&usb_dev->dev, adapter);
 
 	adapter->owner = THIS_MODULE;
 	adapter->class = I2C_CLASS_DEPRECATED;
@@ -137,7 +133,7 @@ struct i2c_adapter *fl2000_i2c_init(struct usb_device *usb_dev)
 
 	ret = i2c_add_adapter(adapter);
 	if (ret) {
-		devres_free(adapter);
+		kfree(adapter);
 		return ERR_PTR(ret);
 	}
 
@@ -146,4 +142,13 @@ struct i2c_adapter *fl2000_i2c_init(struct usb_device *usb_dev)
 		i2c_adapter_id(adapter), usb_path);
 
 	return adapter;
+}
+
+void fl2000_i2c_cleanup(struct i2c_adapter *adapter)
+{
+	if (!adapter)
+		return;
+
+	i2c_del_adapter(adapter);
+	kfree(adapter);
 }
