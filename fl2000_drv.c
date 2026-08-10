@@ -119,6 +119,13 @@ static int fl2000_probe(struct usb_interface *interface, const struct usb_device
 
 	/* When all interfaces are up - proceed with registration */
 	if (devs->active_if == FL2000_ALL_IFS) {
+		/* Bring the chip out of its power-on state before anything tries to use it. The
+		 * I2C master and the monitor detect circuit are enabled by fl2000_usb_magic(), so
+		 * until this runs no EDID can be read over DDC
+		 */
+		fl2000_reset(usb_dev);
+		fl2000_usb_magic(usb_dev);
+
 		ret = component_master_add_with_match(&devs->adapter->dev, &fl2000_master_ops,
 						      devs->match);
 		if (ret) {

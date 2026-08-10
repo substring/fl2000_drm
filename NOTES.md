@@ -111,6 +111,76 @@ VGA bring-up work.
     FL2000_USB_LPM_REG       0x0070
     FL2000_USB_CTRL_REG      0x0078
 
+## CRITICAL — devres lifetime bug makes rmmod/insmod unsafe
+
+**This must be fixed before any further bring-up work. It breaks the debugging
+loop itself.** This is almost certainly what is behind klogg issues #12 / #33.
+
+Observed: after one `rmmod fl2000` + `insmod fl2000.ko` cycle, opening the
+FL2000 i2c bus from userspace oopsed the kernel:
+
+    BUG: unable to handle page fault for address: ffffffffc2b72af0
+    #PF: supervisor write access in kernel mode
+    Oops: 0003 [#1] SMP NOPTI
+    RIP: 0010:try_module_get+0x28/0xe0
+    Call Trace:
+     ? i2c_get_adapter+0x37/0x70
+     i2cdev_open+0x1f/0xd0
+     chrdev_open+0xba/0x250
+    Modules linked in: fl2000(OE) ... [last unloaded: fl2000(OE)]
+
+The faulting address is in module space, and `i2c_get_adapter()` was doing
+`try_module_get(adapter->owner)` where `adapter->owner` is `THIS_MODULE` of the
+*already unloaded* module.
+
+### Root cause
+
+Both the i2c adapter and the regmap are attached to the USB **device**, not to
+the USB **interface** the driver actually binds to:
+
+    fl2000_i2c.c:    devres_add(&usb_dev->dev, adapter);
+    fl2000_registers.c: devm_regmap_init(&usb_dev->dev, ...)
+    fl2000_drv.c:    devm_kzalloc(&usb_dev->dev, ...) and
+                     dev_set_drvdata(&usb_dev->dev, devs)
+
+devres attached to `usb_dev->dev` is released when the *usb_device* goes away —
+i.e. on physical unplug — **not** when the driver's interfaces disconnect on
+`rmmod`. So on module unload `fl2000_i2c_adapter_release()` never runs,
+`i2c_del_adapter()` is never called, and the adapter stays registered in the
+i2c core with `owner` and `algo` pointing into freed module text.
+
+Two consequences, both observed:
+
+1. The stale i2c bus (`i2c-8`) outlives the module. Any access to it —
+   `i2cdetect`, `i2ctransfer`, or a DDC read from another driver — dereferences
+   freed module memory and oopses. It is a landmine left behind by `rmmod`.
+2. On reload, `dev_get_drvdata(&usb_dev->dev)` still returns the **old** `devs`
+   pointer, so `fl2000_probe()` skips `fl2000_get_devices()` entirely and
+   silently reuses the stale adapter and stale regmap. No new i2c bus is
+   created (confirmed: still only `i2c-0`..`i2c-8`, no `i2c-9` after reload).
+   Every register access then calls through freed function pointers.
+
+This also means the "clean" first `rmmod`/`insmod` cycle in this session was not
+clean at all — it had already left the stale adapter behind. The oops merely
+made it visible.
+
+### Fix direction
+
+Move the per-device resources off `usb_dev->dev`. Options, roughly in order of
+preference:
+
+- Anchor devres to the interface the driver actually binds (the AVCONTROL
+  interface, `&interface->dev`), so unbind/rmmod tears it down properly.
+- Or drop devres for the adapter and regmap and manage them explicitly:
+  allocate on first probe, `i2c_del_adapter()` in `fl2000_disconnect()` when the
+  last interface goes away.
+
+Either way `dev_set_drvdata()` must be cleared on disconnect so a reload does
+not pick up a stale `devs`.
+
+Until this is fixed: **do not rmmod.** Reboot between test cycles, or physically
+unplug the dongle before unloading (unplug does release the usb_dev devres).
+
 ## Debugging notes
 
 - regmap debugfs exists at `/sys/kernel/debug/regmap/2-4/` but is of limited
