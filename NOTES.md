@@ -536,6 +536,98 @@ A USBPcap/Wireshark capture on the Windows machine from dongle plug-in to
 desktop-on-VGA contains, by construction, the complete working init sequence.
 Diffing its writes against ours is a mechanical lookup that ends the guessing.
 
+## Round 5 — Windows USB capture analysis
+
+Capture: `~/src/fl2000/win-capture.pcapng`, USBPcap, dongle plug-in →
+desktop on VGA → Display Settings visit. 241 MB total; exactly 48 vendor
+control transfers (26 reads bmRequestType 0xC0/bRequest 64, 22 writes
+0x40/65, wValue 0 throughout — same addressing scheme as ours), plus two
+SET_INTERFACE requests at t=3.907. Everything else is bulk video.
+
+### (a) Full chronological vendor-write list (values little-endian)
+
+    t=3.954  0x8048 = 0x00008004   app reset (bit 15), preserving bit 2 (RMW; read 0x04)
+    t=3.954  0x8020 = 0x100000cc   I2C read @0x4C (ITE probe), monitor_detect set
+    t=3.967  0x8048 = 0x00008004   reset again
+    t=3.967  0x8020 = 0xcf0000cc   2nd ITE probe; writes back status F + edid_detect
+    t=4.728  0x8020 = 0xdf0000cc   adds monitor_detect: bits 28+30 now both set
+    t=5.479  0x8088 = 0x00000088   read 0x488, cleared bit 10
+    t=5.479  0x0070 = 0x04106085   then
+    t=5.479  0x0070 = 0x04186085   U1/U2 reject (bits 20, then 19+20)
+    t=5.480  0x0078 = 0x18010d14   (read back same; bit 17 handling)
+    t=5.759  0x803C = 0xe401084d   read 0xe001084d, +bit 26 (force PLL on)
+    t=5.759  0x802C = 0x000d2102   PLL word
+    t=5.759  0x8048 = 0x00008004   reset
+    t=5.759  0x803C = 0xc401084d   -bit 29
+    t=5.760  0x803C = 0xd501084d   +bits 24, 28
+    t=5.760  0x8004 = 0x0010031c   read 0x0010239c; DAC off, modes cleared
+    t=5.760  0x8004 = 0x0010039d   DAC on (bit 7) + clear_watermark (bit 0)
+    t=5.760  0x8008 = 0x04000540   hactive 1024 | htotal 1344
+    t=5.760  0x800C = 0x00880129   hsync width/start
+    t=5.760  0x8010 = 0x03000326   vactive 768 | vtotal 806
+    t=5.760  0x8014 = 0x02460024   vsync width/start
+    t=5.760  0x801C = 0x00000000   read 0x00850000; ISO bits cleared
+    t=5.760  0x0070 = 0x04186085   (rewrite, same value)
+
+That is a textbook **1024x768@60 modeset** (htotal 1344, vtotal 806) with the
+exact PLL word 0x000d2102 — a complete known-good recipe for this hardware.
+
+### (b) Diff vs our init
+
+| register | Windows end state | ours (probe_only) | verdict |
+|---|---|---|---|
+| 0x8048 reset | bit-15 strobes | same | match |
+| 0x8020 detect bits | 28+30 set | 28+30 set | match |
+| 0x8088 | 0x88 (bit 10 cleared) | 0x88 | match |
+| 0x0070 | 0x04186085 | 0x04186085 (dumped) | **byte-identical** |
+| 0x0078 | 0x18010d14 | 0x18010d14 (dumped) | **byte-identical** |
+| 0x803C | 0xd501084d after modeset | 0xe001084d untouched | differs — modeset only |
+| 0x802C PLL | 0x000d2102 | never written | differs — modeset only |
+| 0x8004 | 0x0010039d | 0x0010239c untouched | differs — modeset only |
+| 0x8008-0x8014 | 1024x768 timings | never written | differs — modeset only |
+| 0x801C | 0 | 0x00850000 | differs — modeset only |
+| GPIO/unknown regs | **none touched** | — | no hidden enable exists |
+
+Three more things the capture settles:
+
+1. **Windows' ITE probe at 0x4C NAKs with i2c_status = 0xF** (readback
+   0x8f0000cc) — the *identical* failure signature we get at 0x50/0x4C.
+   Windows treats it as "no HDMI chip" and continues. Our I2C engine behaves
+   exactly like Windows' does.
+2. **Windows reads 0x8000 and sees 0x600000e1 → 0x200000c1 — the same values
+   we read.** It proceeds to modeset regardless. Those status words are
+   normal for this dongle, not evidence of a dead detect block.
+3. **No EDID read at 0x50 appears anywhere in the capture.** 26 reads total
+   cannot contain a 128-byte EDID fetch (≥96 transfers). Windows served EDID
+   from its registry cache; the Display Settings visit did not force DDC
+   traffic. So the capture does NOT directly show the DDC enable — instead it
+   shows there is no register-level enable to find: **pre-modeset chip state
+   under Windows is byte-identical to ours.**
+
+### (c) Candidate shortlist, ranked
+
+1. **Active video output unlocks DDC (high confidence).** By elimination:
+   register state is identical, I2C engine behaviour is identical, wiring is
+   Windows-proven — the only remaining difference when Windows talks DDC is
+   that sync/video is running. Two known mechanisms fit: monitors that power
+   their DDC section only when sync is present (this Dell shows "Check Cable
+   Connection", i.e. it sees no sync), and dongles that derive DDC +5V from
+   the active output stage. Test: replay the captured modeset verbatim
+   (`ddc_step=4`), watch the monitor react, rescan 0x50.
+2. **0x803C final state 0xd501084d alone (medium).** Bit 26 is "force PLL
+   always on"; bits 24/28 differ from our resting 0xe001084d. If some clock
+   domain feeding the DDC/detect block hangs off these, the 0x803C sequence
+   alone might suffice without full timings (`ddc_step=3`).
+3. **SET_INTERFACE ×2 (low, already eliminated).** Tested as old ddc_step=2
+   with no effect; capture merely confirms Windows does it.
+
+Caveat stated plainly: since the capture contains no DDC transfer, candidate 1
+is inference by elimination, not observation. If replaying the modeset does
+not unlock 0x50, the next capture must be taken with Windows' EDID cache for
+this monitor deleted (Device Manager → Monitors → uninstall device, or
+registry `HKLM\SYSTEM\CurrentControlSet\Enum\DISPLAY` entry removal) so
+Windows is forced to pull EDID over the wire.
+
 ## Debugging notes
 
 - regmap debugfs exists at `/sys/kernel/debug/regmap/2-4/` but is of limited

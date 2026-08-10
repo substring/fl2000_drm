@@ -26,14 +26,15 @@ MODULE_PARM_DESC(vga_mode,
 		 "IT66121 bridge chip, so the component match never completes and the display "
 		 "pipeline never comes up; set this to bring up a VGA connector instead");
 
-/* Cumulative DDC bring-up experiments for the probe_only loop, see NOTES.md "Round 3":
- * 0 = baseline init; 1 = reference-order detect enable (EDID/I2C detect bit alone, 750 ms settle,
- * then the rest); 2 = step 1 plus usb_set_interface(0, 1) first, the reference driver's
- * workaround for FL2000's redundant-endpoint descriptors that kernels >= 5.x ignore
+/* DDC bring-up experiments for the probe_only loop, see NOTES.md "Round 3"/"Round 5":
+ * 0 = baseline init; 1 = reference-order detect enable (EDID/I2C detect bit alone, 750 ms
+ * settle); 2 = step 1 plus usb_set_interface(0, 1) first (both eliminated in Round 3);
+ * 3 = Windows-captured 0x803C sequence (force-PLL-on etc.); 4 = full replay of the captured
+ * Windows 1024x768@60 modeset, bringing sync/DAC live to test sync-dependent DDC
  */
 static int fl2000_ddc_step;
 module_param_named(ddc_step, fl2000_ddc_step, int, 0444);
-MODULE_PARM_DESC(ddc_step, "Cumulative DDC bring-up steps 0-2 (default 0), see NOTES.md");
+MODULE_PARM_DESC(ddc_step, "DDC bring-up experiment 0-4 (default 0), see NOTES.md");
 
 /* Raw-dump the register space at the end of probe (probe_only aid, see NOTES.md) */
 static bool fl2000_dump;
@@ -193,6 +194,15 @@ static int fl2000_probe(struct usb_interface *interface, const struct usb_device
 		}
 
 		fl2000_usb_magic(usb_dev);
+
+		/* Round 5 experiments (alternatives, not cumulative with steps 1/2) */
+		if (fl2000_ddc_step == 3) {
+			ret = fl2000_ddc_step_aclk(usb_dev);
+			dev_info(&usb_dev->dev, "ddc_step3: 0x803C sequence = %d", ret);
+		} else if (fl2000_ddc_step == 4) {
+			ret = fl2000_ddc_step_modeset(usb_dev);
+			dev_info(&usb_dev->dev, "ddc_step4: modeset replay = %d", ret);
+		}
 
 		/* Stop short of DRM. The i2c adapter is live at this point, which is all that is
 		 * needed to exercise the chip's I2C master from userspace

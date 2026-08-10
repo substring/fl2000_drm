@@ -345,6 +345,71 @@ void fl2000_dump_regs(struct usb_device *usb_dev)
 	}
 }
 
+/* Round 5 experiments: values below are VERBATIM from the Windows USBPcap capture
+ * (~/src/fl2000/win-capture.pcapng, NOTES.md "Round 5") of this exact dongle+monitor working.
+ * Not decoded through our field unions on purpose - the point is replaying known-good state
+ */
+
+/* ddc_step=3: the 0x803C sequence Windows performs around its modeset (e4 -> c4 -> d5).
+ * Bit 26 is "force PLL always on"; if a clock domain feeding the DDC/detect block hangs off
+ * these bits, this alone may unlock DDC without full video timings
+ */
+int fl2000_ddc_step_aclk(struct usb_device *usb_dev)
+{
+	struct regmap *regmap = dev_get_regmap(&usb_dev->dev, NULL);
+	int ret;
+
+	ret = regmap_write(regmap, 0x803C, 0xe401084d);
+	if (ret)
+		return ret;
+	ret = regmap_write(regmap, 0x803C, 0xc401084d);
+	if (ret)
+		return ret;
+	return regmap_write(regmap, 0x803C, 0xd501084d);
+}
+
+/* ddc_step=4: full replay of the captured Windows 1024x768@60 modeset, same order. Brings the
+ * output stage up for real: PLL locked, DAC on, sync toward the monitor. Tests the leading
+ * theory that DDC (monitor-side or dongle-side) only powers up once video is active. No pixel
+ * data is streamed - the timing generator runs autonomously, the screen shows black/no-image
+ */
+int fl2000_ddc_step_modeset(struct usb_device *usb_dev)
+{
+	struct regmap *regmap = dev_get_regmap(&usb_dev->dev, NULL);
+	static const struct {
+		u16 reg;
+		u32 val;
+	} seq[] = {
+		{ 0x803C, 0xe401084d }, /* +force PLL always on */
+		{ 0x802C, 0x000d2102 }, /* PLL word for 65 MHz pixel clock */
+		{ 0x8048, 0x00008004 }, /* app reset */
+		{ 0x803C, 0xc401084d },
+		{ 0x803C, 0xd501084d },
+		{ 0x8004, 0x0010031c }, /* DAC off, colour modes cleared */
+		{ 0x8004, 0x0010039d }, /* DAC on + clear watermark */
+		{ 0x8008, 0x04000540 }, /* hactive 1024 | htotal 1344 */
+		{ 0x800C, 0x00880129 }, /* hsync width/start */
+		{ 0x8010, 0x03000326 }, /* vactive 768 | vtotal 806 */
+		{ 0x8014, 0x02460024 }, /* vsync width/start */
+		{ 0x801C, 0x00000000 }, /* ISO bits cleared */
+	};
+	int ret;
+
+	for (int i = 0; i < ARRAY_SIZE(seq); i++) {
+		ret = regmap_write(regmap, seq[i].reg, seq[i].val);
+		if (ret) {
+			dev_err(&usb_dev->dev, "modeset replay: write %04x failed (%d)",
+				seq[i].reg, ret);
+			return ret;
+		}
+		if (seq[i].reg == 0x8048)
+			msleep(FL2000_HW_RST_MDELAY);
+	}
+
+	dev_info(&usb_dev->dev, "modeset replay done: 1024x768@60 sync should be live");
+	return 0;
+}
+
 int fl2000_enable_interrupts(struct usb_device *usb_dev)
 {
 	struct regmap *regmap = dev_get_regmap(&usb_dev->dev, NULL);
