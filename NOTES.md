@@ -181,6 +181,38 @@ not pick up a stale `devs`.
 Until this is fixed: **do not rmmod.** Reboot between test cycles, or physically
 unplug the dongle before unloading (unplug does release the usb_dev devres).
 
+## Phase 2c — VGA DAC init needs no porting
+
+The plan assumed DAC init and VGA mode-setting registers would have to be
+lifted from the old FrescoLogic driver. Comparing the two, they do not.
+
+The FL2000's output stage is natively VGA — the register block is named
+`FL2000_VGA_*` throughout and carries `dac_output_en`, `vga565_mode`,
+`vga332_mode`, `vga_color_palette_en`, `force_vga_connect`. On an HDMI dongle
+the IT66121 sits *downstream* of that same parallel output and converts it.
+So klogg's driver was already programming the VGA path all along; the bridge
+was the only VGA-unaware part.
+
+Concretely, the old driver's DAC enable is:
+
+    fl2000_monitor.c:410   // Set bit 7, Enable external DAC.
+                           fl2000_reg_bit_set(dev_ctx, REG_OFFSET_8004, 7);
+
+`REG_OFFSET_8004` is `FL2000_VGA_CTRL_REG_PXCLK` (`0x8000 + 0x04`), and bit 7
+of that register is `dac_output_en` in klogg's `union
+fl2000_vga_cntrl_reg_pxclk`. `fl2000_set_pixfmt()` already sets it. Likewise
+`fl2000_set_pll()` already sets `force_vga_connect`, and `fl2000_set_timings()`
+already writes the H/V sync registers (`0x8008`/`0x800C`/`0x8010`/`0x8014`) that
+the old driver writes at `REG_OFFSET_8008` onward.
+
+Every bit the old driver touches in `0x8004` (0, 6, 7, 24, 25, 26, 27, 28, 31)
+is either already handled by `fl2000_set_pixfmt()` or belongs to a colour mode
+this driver does not offer. Notably `vga_timing_en` (bit 8) is set by *neither*
+driver, so it is not required.
+
+Conclusion: no register porting needed. The remaining risk for first picture is
+in PLL/timing selection and the streaming path, not DAC bring-up.
+
 ## Debugging notes
 
 - regmap debugfs exists at `/sys/kernel/debug/regmap/2-4/` but is of limited
