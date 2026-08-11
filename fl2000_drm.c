@@ -203,17 +203,17 @@ static const struct drm_connector_funcs fl2000_connector_funcs = {
 
 DEFINE_DRM_GEM_DMA_FOPS(fl2000_drm_driver_fops);
 
-static void fl2000_drm_release(struct drm_device *drm)
-{
-	drm_atomic_helper_shutdown(drm);
-	drm_mode_config_cleanup(drm);
-}
-
+/* No .release callback: it runs after the refcount hits zero, and the old one called
+ * drm_atomic_helper_shutdown() from there - which takes a fresh drm_dev_get() on the dying
+ * device (refcount saturation, "use-after-free" WARN when the compositor dropped the last fd
+ * after hot-unplug). Shutdown now happens in fl2000_drm_if_release() while the device is
+ * alive. The old drm_mode_config_cleanup() call was also redundant-to-harmful: mode config
+ * comes from drmm_mode_config_init() and is cleaned up by the managed release path
+ */
 static struct drm_driver fl2000_drm_driver = {
 	.driver_features = DRIVER_MODESET | DRIVER_GEM | DRIVER_ATOMIC,
 	.ioctls = NULL,
 	.fops = &fl2000_drm_driver_fops,
-	.release = fl2000_drm_release,
 
 	DRM_GEM_DMA_DRIVER_OPS_VMAP,
 	DRM_FBDEV_DMA_DRIVER_OPS,
@@ -541,8 +541,13 @@ static void fl2000_drm_if_release(struct fl2000_drm_if *drm_if, struct device *m
 	/* Stop interrupts interface */
 	fl2000_intr_destroy(usb_dev);
 
-	/* Prepare to DRM device shutdown */
+	/* Prepare to DRM device shutdown. The atomic shutdown must run HERE, while the device
+	 * is still alive - not from the .release callback where the refcount is already zero.
+	 * The pipe callbacks fail fast against an already-removed USB device, so this is safe
+	 * on hot-unplug too
+	 */
 	drm_kms_helper_poll_fini(drm);
+	drm_atomic_helper_shutdown(drm);
 	drm_dev_unplug(drm);
 
 	drm_edid_free(drm_if->drm_edid);
