@@ -707,6 +707,38 @@ Remaining loose ends, in rough priority:
 - The `^ 4` dword-swizzle in the RGB888 pack path is confirmed correct by the
   working picture.
 
+## Hot-unplug incident #2 — semaphore deadlock froze every display
+
+User test: unplug while COSMIC was actively driving the output, replug into a
+different (USB-2) port. Result: all displays froze on the next display
+operation; hard reboot. Previous-boot journal tells the whole story:
+
+    17:02:04  usb 2-4: USB disconnect / Data URB error -19 / Unbinding
+    17:02:05  WARN drm_atomic_helper_wait_for_vblanks: vblank wait timed out
+    17:03:02  [drm] *ERROR* flip_done timed out; commit wait timed out
+    17:05:22  hung task: fl2000_stream_disable -> fl2000_display_disable
+    17:05:22  hung task: output_poll_execute blocked on ww_mutex
+
+Chain: the unplug teardown runs an atomic shutdown holding ALL modeset
+ww_mutexes; inside it stream_disable() called drain_workqueue() while the
+stream worker sat parked in down_interruptible() on work_sem — whose only
+up() sources were URB completions, dead with the cable. drain never returns,
+the locks are never released, and every later commit (COSMIC) and the
+connector poll worker pile up behind them. Screens frozen system-wide; the
+user's disable click merely joined the queue. Note this trap was not
+unplug-specific: an ordinary disable raced it whenever no completion was
+pending at drain time.
+
+Fix (commit "Fix system-wide display freeze on hot-unplug while streaming"):
+stream_disable ups the semaphore after clearing 'enabled' and the worker
+re-checks the flag on wake and exits, so drain always terminates. Plus
+vblank_off before stream teardown in display_disable, since vblanks on this
+device are URB completions — that removes the shutdown-path vblank WARN.
+
+Unrelated to the driver: the replug into the other port never enumerated at
+USB level ("Device not responding to setup address", error -71) — dongle
+needs a working USB-3 port; nothing arrived for the driver to probe.
+
 ## Debugging notes
 
 - regmap debugfs exists at `/sys/kernel/debug/regmap/2-4/` but is of limited
