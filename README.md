@@ -1,3 +1,86 @@
+# FL2000DX VGA dongle support (fork)
+
+This is a fork of [klogg/fl2000_drm](https://github.com/klogg/fl2000_drm) that
+makes **FL2000DX USB3-to-VGA dongles** work as proper DRM/KMS displays on
+current kernels. The upstream driver targets HDMI dongles built around the
+IT66121 bridge chip; on VGA dongles there is no bridge, the component match
+never completes, and the display never comes up. This fork adds a direct path
+for the chip's integrated VGA DAC.
+
+### What this fork adds
+
+- **VGA dongle support** (`vga_mode=1`): a `DRM_MODE_CONNECTOR_VGA` connector
+  driving the FL2000DX's integrated DAC, no bridge chip required.
+- **EDID-less operation with VESA fallback modes.** These VGA dongles have no
+  usable DDC path to the monitor — established by a lengthy investigation
+  culminating in a USB capture of the working Windows driver, which performs
+  no DDC traffic either (it serves EDID from the OS cache). Modes up to
+  1920x1200 are offered with 1024x768@60 preferred.
+- **Hotplug detect via the undocumented `0x805C` connector-sense register**,
+  found by raw-diffing chip state against physical cable changes. It reads
+  zero with no cable and a stable analog-sense pattern with a monitor
+  attached, which lets `detect()` report real `connected`/`disconnected`
+  states — desktops auto-enable the display on plug-in.
+- **Port to current kernels** (developed and tested on 7.0; upstream baseline
+  was 6.5): fbdev client API, `struct drm_edid` API, bridge attach signature.
+- **Five teardown/lifetime fixes**, several of which likely correspond to
+  long-standing upstream issues
+  [#12](https://github.com/klogg/fl2000_drm/issues/12) and
+  [#33](https://github.com/klogg/fl2000_drm/issues/33): a devres lifetime bug
+  that left a registered i2c adapter pointing into freed module text after
+  rmmod; a disconnect deadlock between `i2c_del_adapter()` and the DRM
+  device's devres parenting; a stream-worker semaphore deadlock that froze
+  every display in the system on hot-unplug; an anchored-URB leak that could
+  wedge a USB port for good on a flaky unplug; and an atomic shutdown called
+  from the DRM release callback after the refcount already hit zero.
+
+The full investigation record — every dead end included — is in
+[NOTES.md](NOTES.md).
+
+### Quick start
+
+Requirements: kernel headers and build tools (`build-essential`,
+`linux-headers-$(uname -r)`).
+
+```
+make
+sudo modprobe drm_dma_helper
+sudo insmod fl2000.ko vga_mode=1
+```
+
+A connected VGA monitor should appear as a normal display and be enabled by
+your desktop automatically.
+
+**USB 3 ports only.** The FL2000's descriptors declare duplicate endpoints,
+which modern kernels reject when the device enumerates at USB 2 speed
+(`can't set config #1, error -71`). On USB 3 the affected interfaces use
+alternate settings and enumerate fine.
+
+Without `vga_mode=1` the driver behaves like upstream (HDMI/IT66121 path).
+Debugging aids from the investigation are also available: `probe_only=1`
+brings up only the USB/register/I2C layer, and `dump_regs=1` dumps raw chip
+state at probe.
+
+### Tested on
+
+One FL2000DX-based VGA dongle with one VGA monitor, on Pop!_OS 24.04
+(kernel 7.0.11, COSMIC desktop, AMD primary GPU). Hot-unplug and replug
+while the desktop is extended have been exercised deliberately and survive
+cleanly. That is the honest extent of the testing — reports from other
+dongles, monitors, kernels and desktops are very welcome in the issues.
+
+### Attribution and license
+
+Fork of [klogg/fl2000_drm](https://github.com/klogg/fl2000_drm) by Artem
+Mygaiev — the clean DRM implementation this work builds on. Register-level
+reference material from the abandoned official
+[FrescoLogic/FL2000](https://github.com/FrescoLogic/FL2000) driver. Same
+license as upstream: **GPL-2.0**.
+
+---
+
+## Original upstream README
+
 [![Gitter](https://badges.gitter.im/fl2000_drm/community.svg)](https://gitter.im/fl2000_drm/community?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge)
 [![Build](https://github.com/klogg/fl2000_drm/actions/workflows/makefile.yml/badge.svg)](https://github.com/klogg/fl2000_drm/actions/workflows/makefile.yml)
 [![Stylecheck](https://github.com/klogg/fl2000_drm/actions/workflows/codingstyle.yaml/badge.svg)](https://github.com/klogg/fl2000_drm/actions/workflows/codingstyle.yaml)
