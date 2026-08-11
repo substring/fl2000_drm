@@ -4,14 +4,14 @@
 #   <log in at the text console>
 #   cd ~/src/fl2000/fl2000_drm && sudo ./tty_test.sh
 #
-# Everything is logged to ~/src/fl2000/tty-test.log for later analysis.
+# Everything is logged to tty-test.log next to this script for later analysis.
 # The test pattern stays up until you press Enter (or 5 minutes). Photograph the
 # monitor while it shows. Afterwards the module is LEFT LOADED so that
 #   sudo systemctl isolate graphical.target
 # lets the compositor discover the connector (stage 4 of the plan).
 
-LOG=/home/rroberts/src/fl2000/tty-test.log
-DIR=/home/rroberts/src/fl2000/fl2000_drm
+DIR="$(cd "$(dirname "$0")" && pwd)"
+LOG="$DIR/tty-test.log"
 
 exec > >(tee "$LOG") 2>&1
 
