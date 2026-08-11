@@ -246,6 +246,13 @@ static void fl2000_stream_work(struct work_struct *work)
 		ret = fl2000_submit_urb(data_urb);
 		if (ret) {
 			dev_err(&usb_dev->dev, "Data URB error %d", ret);
+			/* Must unanchor before dropping the reference: a failed-submit URB left
+			 * in the anchor is never completed and never given back, and teardown's
+			 * kill loop chokes on it - observed as a kworker live-spinning in
+			 * usb_kill_anchored_urbs() inside disconnect for tens of minutes while
+			 * holding the USB device mutex, wedging the whole port
+			 */
+			usb_unanchor_urb(data_urb);
 			usb_free_urb(data_urb);
 			stream->enabled = false;
 		}
@@ -352,6 +359,10 @@ int fl2000_stream_enable(struct fl2000_stream *stream)
 {
 	BUG_ON(list_empty(&stream->transmit_list));
 
+	/* The anchor is empty here; re-init clears any poisoned state a previous disable left
+	 * behind, which would otherwise auto-reject every URB of the new session
+	 */
+	init_usb_anchor(&stream->anchor);
 	sema_init(&stream->work_sem, 0);
 	stream->enabled = true;
 	queue_work(stream->work_queue, &stream->work);
@@ -376,8 +387,16 @@ void fl2000_stream_disable(struct fl2000_stream *stream)
 
 	drain_workqueue(stream->work_queue);
 
-	if (!usb_wait_anchor_empty_timeout(&stream->anchor, 1000))
-		usb_kill_anchored_urbs(&stream->anchor);
+	/* Poison rather than kill: poisoning also rejects any URB that races in afterwards.
+	 * Anything still anchored after that (e.g. a failed-submit straggler that can never
+	 * complete) is scuttled - dropped from the anchor without waiting - because waiting on
+	 * a URB the HCD will never give back spins forever on a glitched/dead port. The next
+	 * fl2000_stream_enable() starts from a clean semaphore; re-init the anchor state too
+	 */
+	if (!usb_wait_anchor_empty_timeout(&stream->anchor, 1000)) {
+		usb_poison_anchored_urbs(&stream->anchor);
+		usb_scuttle_anchored_urbs(&stream->anchor);
+	}
 
 	spin_lock_irq(&stream->list_lock);
 	while (!list_empty(&stream->transmit_list)) {
