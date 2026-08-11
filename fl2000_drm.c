@@ -395,9 +395,14 @@ static void fl2000_display_disable(struct drm_simple_display_pipe *pipe)
 	struct drm_device *drm = pipe->crtc.dev;
 	struct fl2000_drm_if *drm_if = drm->dev_private;
 
-	fl2000_stream_disable(drm_if->stream);
-
+	/* Vblanks on this device ARE stream URB completions, so they stop the moment the
+	 * stream does (and never come at all after hot-unplug). Turn vblanks off first: it
+	 * wakes every waiter and flushes pending events, instead of letting the atomic helper
+	 * wait out a timeout against a stream that can no longer tick
+	 */
 	drm_crtc_vblank_off(crtc);
+
+	fl2000_stream_disable(drm_if->stream);
 }
 
 static void fb2000_dirty(struct drm_framebuffer *fb, struct drm_rect *rect)

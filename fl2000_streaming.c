@@ -193,6 +193,16 @@ static void fl2000_stream_work(struct work_struct *work)
 			return;
 		}
 
+		/* Disable wakes us through the semaphore precisely so we can exit: URB
+		 * completions are the only other source of ups, and they stop (or never come,
+		 * on hot-unplug) once streaming winds down. Without this check the worker sat
+		 * parked in down_interruptible() forever and drain_workqueue() in
+		 * fl2000_stream_disable() deadlocked inside an atomic commit that held every
+		 * modeset lock - freezing all displays system-wide
+		 */
+		if (!stream->enabled)
+			return;
+
 		spin_lock_irqsave(&stream->list_lock, flags);
 
 		/* If no buffers are available for immediate transmission - then copy latest
@@ -358,6 +368,11 @@ void fl2000_stream_disable(struct fl2000_stream *stream)
 	struct fl2000_stream_buf *cur_sb;
 
 	stream->enabled = false;
+
+	/* Unblock a worker parked on the semaphore so drain can complete; the worker checks
+	 * 'enabled' on wake and exits
+	 */
+	up(&stream->work_sem);
 
 	drain_workqueue(stream->work_queue);
 
