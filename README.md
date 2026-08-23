@@ -112,3 +112,31 @@ modprobe drm_kms_helper
 **NOTE:** proper kernel headers and build tools (e.g. "build-essential" package) must be installed on the system. Driver is developed and tested on Ubuntu 22.04 with **Linux kernel 6.5.0**, so better to test it this way. Please use gcc-8 or newer to build the driver
 
 For more information check project's [Wiki](https://github.com/klogg/fl2000_drm/wiki)
+
+### Install via DKMS (survives kernel updates)
+
+The out-of-tree module silently stops loading after a kernel update unless it is
+managed by DKMS. Package it once and it rebuilds automatically on every new kernel:
+
+```sh
+VER=1.0
+sudo cp -r . /usr/src/fl2000-$VER          # includes dkms.conf
+sudo dkms add    -m fl2000 -v $VER
+sudo dkms build  -m fl2000 -v $VER
+sudo dkms install -m fl2000 -v $VER
+```
+
+Force VGA mode and keep the crashing HDMI bridge out of the way:
+
+```sh
+# /etc/modprobe.d/fl2000.conf
+options fl2000 vga_mode=1
+install it66121 /bin/true
+
+# /etc/modules-load.d/fl2000.conf
+fl2000
+```
+
+**Why block it66121:** on recent kernels (observed on 7.0.11) `it66121_probe()`
+oopses and wedges the module (only a reboot clears it). VGA output does not use
+the IT66121 HDMI bridge, so `vga_mode=1` + not loading it66121 is the stable path.

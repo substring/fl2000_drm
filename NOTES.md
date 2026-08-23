@@ -749,3 +749,19 @@ needs a working USB-3 port; nothing arrived for the driver to probe.
       echo 'module fl2000 +p' | sudo tee /sys/kernel/debug/dynamic_debug/control
 - `fl2000.ko` depends on `drm_dma_helper`; `modprobe drm_dma_helper` first when
   using `insmod`.
+
+## Incident: it66121_probe oops on kernel 7.0.11 + DKMS packaging
+
+After a Pop!_OS kernel bump to 7.0.11-76070011-generic the dongle went dark.
+Root cause was twofold:
+
+1. The module was never DKMS-managed, so the kernel update left it unbuilt.
+2. Loading `it66121.ko` on this kernel oopses inside `it66121_probe()` (stack:
+   `it66121_probe+0x347`) and leaves the module reference-wedged (`rmmod` fails
+   "in use"; only a reboot clears it). This blocks fl2000 from bringing up a
+   display even for the VGA path.
+
+Fix: rebuilt cleanly against 7.0.11 (source unchanged — the teardown fixes still
+apply), packaged as DKMS (`dkms.conf`) so future kernel updates auto-rebuild, and
+installed **fl2000 only** — it66121 is blacklisted via `install it66121 /bin/true`.
+Load with `vga_mode=1`. See README "Install via DKMS".
