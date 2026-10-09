@@ -7,6 +7,9 @@
  *          register, freshly read from the chip
  *  dump    read the whole control register space, bypassing the regmap cache
  *  frames  read frame pacing statistics from stream URB completions; write anything to reset
+ *  pokes   bit overrides applied during every modeset, before the chip reset and again at the
+ *          end: write "REG SETMASK CLRMASK" to add one, "clear" to drop them all; read lists them.
+ *          For bits that only latch on reset, which live register writes cannot reveal
  */
 
 #include "fl2000.h"
@@ -18,6 +21,89 @@ static const struct {
 } fl2000_dump_ranges[] = {
 	{ 0x0000, 0x00FC },
 	{ 0x8000, 0x80FC },
+};
+
+#define FL2000_MAX_POKES 8
+
+/* Module wide: there is only ever one dongle under test */
+static struct {
+	u32 reg;
+	u32 set;
+	u32 clr;
+} fl2000_pokes[FL2000_MAX_POKES];
+static unsigned int fl2000_num_pokes;
+static DEFINE_MUTEX(fl2000_pokes_lock);
+
+void fl2000_debugfs_apply_pokes(struct usb_device *usb_dev)
+{
+	mutex_lock(&fl2000_pokes_lock);
+	for (unsigned int i = 0; i < fl2000_num_pokes; i++) {
+		u32 val;
+
+		if (fl2000_reg_raw_read(usb_dev, fl2000_pokes[i].reg, &val))
+			continue;
+		val = (val & ~fl2000_pokes[i].clr) | fl2000_pokes[i].set;
+		fl2000_reg_raw_write(usb_dev, fl2000_pokes[i].reg, val);
+	}
+	mutex_unlock(&fl2000_pokes_lock);
+}
+
+static int fl2000_debugfs_pokes_show(struct seq_file *s, void *unused)
+{
+	mutex_lock(&fl2000_pokes_lock);
+	for (unsigned int i = 0; i < fl2000_num_pokes; i++)
+		seq_printf(s, "0x%04x set 0x%08x clr 0x%08x\n", fl2000_pokes[i].reg,
+			   fl2000_pokes[i].set, fl2000_pokes[i].clr);
+	mutex_unlock(&fl2000_pokes_lock);
+
+	return 0;
+}
+
+static int fl2000_debugfs_pokes_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, fl2000_debugfs_pokes_show, inode->i_private);
+}
+
+static ssize_t fl2000_debugfs_pokes_write(struct file *file, const char __user *ubuf,
+					  size_t count, loff_t *ppos)
+{
+	char buf[48];
+	u32 reg, set, clr;
+	int ret = count;
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+	buf[count] = '\0';
+
+	mutex_lock(&fl2000_pokes_lock);
+	if (!strncmp(buf, "clear", 5)) {
+		fl2000_num_pokes = 0;
+	} else if (sscanf(buf, "%x %x %x", &reg, &set, &clr) == 3 && reg <= 0xFFFF && !(reg & 3)) {
+		if (fl2000_num_pokes < FL2000_MAX_POKES) {
+			fl2000_pokes[fl2000_num_pokes].reg = reg;
+			fl2000_pokes[fl2000_num_pokes].set = set;
+			fl2000_pokes[fl2000_num_pokes].clr = clr;
+			fl2000_num_pokes++;
+		} else {
+			ret = -ENOSPC;
+		}
+	} else {
+		ret = -EINVAL;
+	}
+	mutex_unlock(&fl2000_pokes_lock);
+
+	return ret;
+}
+
+static const struct file_operations fl2000_debugfs_pokes_fops = {
+	.owner = THIS_MODULE,
+	.open = fl2000_debugfs_pokes_open,
+	.read = seq_read,
+	.write = fl2000_debugfs_pokes_write,
+	.llseek = seq_lseek,
+	.release = single_release,
 };
 
 struct fl2000_debugfs {
@@ -202,6 +288,7 @@ struct fl2000_debugfs *fl2000_debugfs_init(struct usb_device *usb_dev)
 	debugfs_create_file("reg", 0600, dbg->dir, dbg, &fl2000_debugfs_reg_fops);
 	debugfs_create_file("dump", 0400, dbg->dir, dbg, &fl2000_debugfs_dump_fops);
 	debugfs_create_file("frames", 0600, dbg->dir, dbg, &fl2000_debugfs_frames_fops);
+	debugfs_create_file("pokes", 0600, dbg->dir, dbg, &fl2000_debugfs_pokes_fops);
 
 	return dbg;
 }

@@ -370,6 +370,23 @@ static enum drm_mode_status fl2000_display_mode_valid(struct drm_simple_display_
 	if (fl2000_get_bytes_pix(usb_dev->speed, adjusted_mode.clock) == 0)
 		return MODE_BAD;
 
+	/* No interlace support found in the timing generator so far */
+	if (mode->flags & (DRM_MODE_FLAG_INTERLACE | DRM_MODE_FLAG_DBLSCAN))
+		return MODE_NO_INTERLACE;
+
+	/* Register field widths: anything larger would be silently truncated */
+	if (adjusted_mode.htotal > 4095 || adjusted_mode.vtotal > 4095)
+		return MODE_BAD;
+	if (adjusted_mode.hsync_end - adjusted_mode.hsync_start < 1 ||
+	    adjusted_mode.hsync_end - adjusted_mode.hsync_start > 511)
+		return MODE_HSYNC_WIDE;
+	if (adjusted_mode.vsync_end - adjusted_mode.vsync_start < 1 ||
+	    adjusted_mode.vsync_end - adjusted_mode.vsync_start > 15)
+		return MODE_VSYNC_WIDE;
+	/* vstart also goes to the 10 bit start_latency field */
+	if (adjusted_mode.vtotal - adjusted_mode.vsync_start + 1 > 1023)
+		return MODE_V_ILLEGAL;
+
 	return MODE_OK;
 }
 
@@ -500,6 +517,9 @@ static void fl2000_output_mode_set(struct drm_encoder *encoder, struct drm_displ
 	/* Set PLL settings */
 	fl2000_set_pll(usb_dev, &pll);
 
+	/* Debug bit overrides, in place before the reset latches anything */
+	fl2000_debugfs_apply_pokes(usb_dev);
+
 	/* Reset FL2000 & confirm PLL settings */
 	fl2000_reset(usb_dev);
 
@@ -516,6 +536,9 @@ static void fl2000_output_mode_set(struct drm_encoder *encoder, struct drm_displ
 	fl2000_enable_interrupts(usb_dev);
 
 	fl2000_afe_magic(usb_dev);
+
+	/* And again, in case the reset or the setup above cleared them */
+	fl2000_debugfs_apply_pokes(usb_dev);
 
 	fl2000_stream_mode_set(drm_if->stream, mode->hdisplay * mode->vdisplay, bytes_pix);
 }

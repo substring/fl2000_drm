@@ -121,8 +121,9 @@ union fl2000_vga_hsync_reg2 {
 	struct {
 		u32 hstart	: 12;
 		u32 __reserved1 : 4;
-		u32 hsync_width : 8;
-		u32 __reserved2 : 8;
+		/* 9 bits at least: the Windows driver programs 280 for 2560x1600 */
+		u32 hsync_width : 9;
+		u32 __reserved2 : 7;
 	} __aligned(4) __packed;
 };
 
@@ -143,8 +144,8 @@ union fl2000_vga_vsync_reg2 {
 	struct {
 		u32 vstart	  : 12;
 		u32 __reserved1	  : 4;
-		u32 vsync_width	  : 3;
-		u32 __reserved2	  : 1;
+		/* 4 bits: the Windows driver programs 8 for 848x480 */
+		u32 vsync_width	  : 4;
 		u32 start_latency : 10;
 		u32 __reserved3	  : 1;
 		u32 buf_error_en  : 1;

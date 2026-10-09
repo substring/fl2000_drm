@@ -208,6 +208,7 @@ void fl2000_stream_reset_stats(struct usb_device *usb_dev);
 struct fl2000_debugfs;
 struct fl2000_debugfs *fl2000_debugfs_init(struct usb_device *usb_dev);
 void fl2000_debugfs_cleanup(struct fl2000_debugfs *dbg);
+void fl2000_debugfs_apply_pokes(struct usb_device *usb_dev);
 
 /* I2C address of the monitor's DDC/EDID EEPROM, reached over the FL2000's own I2C master */
 #define FL2000_DDC_ADDR 0x50
