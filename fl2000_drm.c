@@ -247,7 +247,7 @@ static const struct drm_connector_funcs fl2000_connector_funcs = {
 	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
 };
 
-DEFINE_DRM_GEM_DMA_FOPS(fl2000_drm_driver_fops);
+DEFINE_DRM_GEM_FOPS(fl2000_drm_driver_fops);
 
 /* No .release callback: it runs after the refcount hits zero, and the old one called
  * drm_atomic_helper_shutdown() from there - which takes a fresh drm_dev_get() on the dying
@@ -261,8 +261,13 @@ static struct drm_driver fl2000_drm_driver = {
 	.ioctls = NULL,
 	.fops = &fl2000_drm_driver_fops,
 
-	DRM_GEM_DMA_DRIVER_OPS_VMAP,
-	DRM_FBDEV_DMA_DRIVER_OPS,
+	/* Shmem rather than DMA buffers: the chip is fed by the CPU anyway, and shmem lets a GPU
+	 * render into buffers we import without mapping them for DMA. The DRM device sits on a USB
+	 * interface, which has no DMA mask: GEM DMA imports WARNed in dma_map_sg() and, without an
+	 * IOMMU translating for the USB controller, could not be contiguous anyway
+	 */
+	DRM_GEM_SHMEM_DRIVER_OPS,
+	DRM_FBDEV_SHMEM_DRIVER_OPS,
 
 	.name = DRM_DRIVER_NAME,
 	.desc = DRM_DRIVER_DESC,
@@ -483,7 +488,8 @@ static void fb2000_dirty(struct drm_framebuffer *fb, struct drm_rect *rect)
 	int idx;
 	struct drm_device *drm = fb->dev;
 	struct fl2000_drm_if *drm_if = drm->dev_private;
-	struct drm_gem_dma_object *dma_obj = drm_fb_dma_get_gem_obj(fb, 0);
+	struct iosys_map map[DRM_FORMAT_MAX_PLANES];
+	struct iosys_map data[DRM_FORMAT_MAX_PLANES];
 
 	UNUSED(rect);
 
@@ -492,15 +498,20 @@ static void fb2000_dirty(struct drm_framebuffer *fb, struct drm_rect *rect)
 		return;
 	}
 
-	ret = drm_gem_fb_begin_cpu_access(fb, DMA_FROM_DEVICE);
+	/* Works for our own buffers and for imported ones alike (a GPU renders, we display) */
+	ret = drm_gem_fb_vmap(fb, map, data);
 	if (ret)
-		return;
+		goto out;
 
-	fl2000_stream_compress(drm_if->stream, dma_obj->vaddr, fb->height, fb->width,
-			       fb->pitches[0]);
+	ret = drm_gem_fb_begin_cpu_access(fb, DMA_FROM_DEVICE);
+	if (!ret) {
+		fl2000_stream_compress(drm_if->stream, data[0].vaddr, fb->height, fb->width,
+				       fb->pitches[0]);
+		drm_gem_fb_end_cpu_access(fb, DMA_FROM_DEVICE);
+	}
 
-	drm_gem_fb_end_cpu_access(fb, DMA_FROM_DEVICE);
-
+	drm_gem_fb_vunmap(fb, map);
+out:
 	drm_dev_exit(idx);
 }
 

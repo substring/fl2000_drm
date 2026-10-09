@@ -21,3 +21,4 @@ spelling.txt
 .vscode-ctags
 .vscode/*
 tools/fl2k_mode
+tools/fl2k_primetest

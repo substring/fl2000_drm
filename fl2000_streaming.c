@@ -340,13 +340,24 @@ void fl2000_stream_compress(struct fl2000_stream *stream, void *src, unsigned in
 	u32 dst_line_len;
 	unsigned long flags;
 
-	BUG_ON(list_empty(&stream->render_list));
-
 	spin_lock_irqsave(&stream->list_lock, flags);
+
+	/* No buffer to render into: the stream is being torn down or rebuilt (seen when the device
+	 * was unbound and rebound while fbdev restored its mode). Drop the frame; a BUG_ON here
+	 * killed the kworker with every modeset lock held and wedged the machine
+	 */
+	if (WARN_ON_ONCE(list_empty(&stream->render_list))) {
+		spin_unlock_irqrestore(&stream->list_lock, flags);
+		return;
+	}
 
 	cur_sb = list_first_entry(&stream->render_list, struct fl2000_stream_buf, list);
 	dst = cur_sb->vaddr;
 	dst_line_len = width * stream->bytes_pix;
+
+	/* The buffer is sized for the mode, the copy for the framebuffer: never write past it */
+	if (dst_line_len && height * dst_line_len > stream->buf_size)
+		height = stream->buf_size / dst_line_len;
 
 	if (fl2000_test_fill) {
 		/* Diagnostic: ignore the framebuffer and transmit solid white. The chip paces
