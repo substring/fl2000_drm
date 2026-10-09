@@ -136,10 +136,56 @@ static int fl2000_get_edid_block(void *data, u8 *buf, unsigned int block, size_t
 	return 0;
 }
 
+/* Line frequency window accepted in 15 kHz CRT mode, Hz: NTSC and PAL rates with some margin */
+#define FL2000_CRT15K_HFREQ_MIN 14500
+#define FL2000_CRT15K_HFREQ_MAX 16800
+
+/* Progressive 15 kHz modes for a TV or arcade monitor. Centring is a first guess, to be tuned
+ * on a real CRT
+ */
+static const struct drm_display_mode fl2000_crt15k_modes[] = {
+	/* 640x240@60, 12.27 MHz, 15.73 kHz: the console mode, 80x15 text */
+	{ DRM_MODE("640x240", DRM_MODE_TYPE_DRIVER, 12270, 640, 656, 714, 780, 0, 240, 244, 247,
+		   262, 0, DRM_MODE_FLAG_NHSYNC | DRM_MODE_FLAG_NVSYNC) },
+	/* 320x240@60, 6.7 MHz, 15.73 kHz */
+	{ DRM_MODE("320x240", DRM_MODE_TYPE_DRIVER, 6700, 320, 336, 368, 426, 0, 240, 244, 247,
+		   262, 0, DRM_MODE_FLAG_NHSYNC | DRM_MODE_FLAG_NVSYNC) },
+	/* 2560x240@60, 52 MHz super resolution, 15.63 kHz */
+	{ DRM_MODE("2560x240", DRM_MODE_TYPE_DRIVER, 52000, 2560, 2624, 2864, 3328, 0, 240, 244,
+		   247, 262, 0, DRM_MODE_FLAG_NHSYNC | DRM_MODE_FLAG_NVSYNC) },
+	/* 720x288@50, 13.5 MHz, 15.63 kHz */
+	{ DRM_MODE("720x288", DRM_MODE_TYPE_DRIVER, 13500, 720, 732, 795, 864, 0, 288, 290, 293,
+		   312, 0, DRM_MODE_FLAG_NHSYNC | DRM_MODE_FLAG_NVSYNC) },
+};
+
+static int fl2000_crt15k_get_modes(struct drm_connector *connector)
+{
+	int count = 0;
+
+	for (int i = 0; i < ARRAY_SIZE(fl2000_crt15k_modes); i++) {
+		struct drm_display_mode *mode;
+
+		mode = drm_mode_duplicate(connector->dev, &fl2000_crt15k_modes[i]);
+		if (!mode)
+			continue;
+		if (i == 0)
+			mode->type |= DRM_MODE_TYPE_PREFERRED;
+		drm_mode_set_name(mode);
+		drm_mode_probed_add(connector, mode);
+		count++;
+	}
+
+	return count;
+}
+
 static int fl2000_connector_get_modes(struct drm_connector *connector)
 {
 	struct fl2000_drm_if *drm_if = container_of(connector, struct fl2000_drm_if, connector);
 	int count;
+
+	/* A TV has no EDID worth reading, and the VGA fallback list would be harmful */
+	if (fl2000_crt15k)
+		return fl2000_crt15k_get_modes(connector);
 
 	/* Re-read rather than cache: a VGA sink can be swapped without us being told */
 	drm_edid_free(drm_if->drm_edid);
@@ -369,6 +415,14 @@ static enum drm_mode_status fl2000_display_mode_valid(struct drm_simple_display_
 
 	if (fl2000_get_bytes_pix(usb_dev->speed, adjusted_mode.clock) == 0)
 		return MODE_BAD;
+
+	/* In CRT mode nothing outside the 15 kHz band may reach the screen, whatever asked for it */
+	if (fl2000_crt15k) {
+		u32 hfreq = div_u64((u64)adjusted_mode.clock * 1000, adjusted_mode.htotal);
+
+		if (hfreq < FL2000_CRT15K_HFREQ_MIN || hfreq > FL2000_CRT15K_HFREQ_MAX)
+			return MODE_H_ILLEGAL;
+	}
 
 	/* No interlace support found in the timing generator so far */
 	if (mode->flags & (DRM_MODE_FLAG_INTERLACE | DRM_MODE_FLAG_DBLSCAN))

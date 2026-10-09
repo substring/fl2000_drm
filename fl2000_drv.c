@@ -41,6 +41,13 @@ static bool fl2000_dump;
 module_param_named(dump_regs, fl2000_dump, bool, 0444);
 MODULE_PARM_DESC(dump_regs, "Dump raw register space after probe init (default 0)");
 
+bool fl2000_crt15k;
+module_param_named(crt15k, fl2000_crt15k, bool, 0444);
+MODULE_PARM_DESC(crt15k,
+		 "15 kHz CRT mode (default 0): offer only 15 kHz modes, prefer 640x240, and refuse "
+		 "any mode whose line frequency is outside 14.5-16.8 kHz, including modes forced "
+		 "from userspace. Protects a TV or arcade monitor from VGA rates");
+
 bool fl2000_test_fill;
 module_param_named(test_fill, fl2000_test_fill, bool, 0644);
 MODULE_PARM_DESC(test_fill,

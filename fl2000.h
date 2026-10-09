@@ -218,6 +218,9 @@ void fl2000_debugfs_apply_pokes(struct usb_device *usb_dev);
  */
 extern bool fl2000_vga_mode;
 
+/* 15 kHz CRT mode: 15 kHz modes only, everything else refused. Defined in fl2000_drv.c */
+extern bool fl2000_crt15k;
+
 /* Diagnostic: stream solid white instead of framebuffer content. Defined in fl2000_drv.c */
 extern bool fl2000_test_fill;
 
