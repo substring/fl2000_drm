@@ -156,7 +156,7 @@ int main(int argc, char **argv)
 	void *px;
 	int fd, opt, ret;
 
-	while ((opt = getopt(argc, argv, "p:t:")) != -1) {
+	while ((opt = getopt(argc, argv, "+p:t:")) != -1) {
 		switch (opt) {
 		case 'p':
 			pattern = optarg;

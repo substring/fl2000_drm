@@ -72,12 +72,13 @@ def measure(modeline, seconds, d):
             f.write("0")
         time.sleep(seconds)
         stats = read_frames(d)
+        # Read while the mode is still held: fbdev restores its own mode on exit
+        conf = last_configured_mode()
     finally:
         proc.stdin.write("\n")
         proc.stdin.flush()
         proc.wait(timeout=5)
 
-    conf = last_configured_mode()
     if not conf or stats.get("count", 0) < 3:
         return f"no data (count={stats.get('count')}, configured={conf})"
 
