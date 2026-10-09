@@ -210,6 +210,25 @@ int fl2000_set_pixfmt(struct usb_device *usb_dev, u32 bytes_pix)
 	return 0;
 }
 
+/* Sync polarity: 0 is negative, 1 positive. Checked on a 15 kHz CRT TV, which wants negative
+ * syncs and loses sync with both bits set (the state after reset, never touched before). The
+ * Windows driver also clears both for 640x480@60, the VESA negative/negative mode
+ */
+int fl2000_set_polarity(struct usb_device *usb_dev, bool hsync_positive, bool vsync_positive)
+{
+	struct regmap *regmap = dev_get_regmap(&usb_dev->dev, NULL);
+	union fl2000_vga_cntrl_reg_pxclk pxclk = { .val = 0 };
+	u32 mask = 0;
+
+	pxclk.hsync_polarity = hsync_positive;
+	fl2000_add_bitmask(mask, union fl2000_vga_cntrl_reg_pxclk, hsync_polarity);
+	pxclk.vsync_polarity = vsync_positive;
+	fl2000_add_bitmask(mask, union fl2000_vga_cntrl_reg_pxclk, vsync_polarity);
+	regmap_write_bits(regmap, FL2000_VGA_CTRL_REG_PXCLK, mask, pxclk.val);
+
+	return 0;
+}
+
 int fl2000_set_transfers(struct usb_device *usb_dev)
 {
 	struct regmap *regmap = dev_get_regmap(&usb_dev->dev, NULL);

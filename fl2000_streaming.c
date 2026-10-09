@@ -193,6 +193,37 @@ static void fl2000_stream_data_completion(struct urb *urb)
 	usb_free_urb(urb);
 }
 
+static void fl2000_stream_zlp_completion(struct urb *urb)
+{
+	usb_free_urb(urb);
+}
+
+/* A frame that is not a whole number of packets ends in a short packet, and URB_ZERO_PACKET then
+ * sends nothing more. The chip does not take a short packet as the end of a frame (measured: a
+ * 224x240 RGB888 frame, 157.5 packets, ran at 88 Hz instead of 60), so follow such frames with an
+ * explicit zero length packet
+ */
+static void fl2000_stream_send_zlp(struct fl2000_stream *stream)
+{
+	struct usb_device *usb_dev = stream->usb_dev;
+	unsigned int pipe = usb_sndbulkpipe(usb_dev, 1);
+	struct urb *zlp_urb;
+
+	if (!(stream->buf_size % usb_maxpacket(usb_dev, pipe)))
+		return;
+
+	zlp_urb = usb_alloc_urb(0, GFP_KERNEL);
+	if (!zlp_urb)
+		return;
+
+	usb_fill_bulk_urb(zlp_urb, usb_dev, pipe, NULL, 0, fl2000_stream_zlp_completion, NULL);
+	usb_anchor_urb(zlp_urb, &stream->anchor);
+	if (fl2000_submit_urb(zlp_urb)) {
+		usb_unanchor_urb(zlp_urb);
+		usb_free_urb(zlp_urb);
+	}
+}
+
 /* TODO: convert to tasklet */
 static void fl2000_stream_work(struct work_struct *work)
 {
@@ -275,6 +306,8 @@ static void fl2000_stream_work(struct work_struct *work)
 			usb_unanchor_urb(data_urb);
 			usb_free_urb(data_urb);
 			stream->enabled = false;
+		} else {
+			fl2000_stream_send_zlp(stream);
 		}
 	}
 }

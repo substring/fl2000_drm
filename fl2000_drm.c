@@ -583,6 +583,10 @@ static void fl2000_output_mode_set(struct drm_encoder *encoder, struct drm_displ
 	/* Pixel format according to number of bytes per pixel */
 	fl2000_set_pixfmt(usb_dev, bytes_pix);
 
+	/* Positive only when asked for: CRTs that care want negative syncs */
+	fl2000_set_polarity(usb_dev, adjusted_mode->flags & DRM_MODE_FLAG_PHSYNC,
+			    adjusted_mode->flags & DRM_MODE_FLAG_PVSYNC);
+
 	/* Configure frame transfers */
 	fl2000_set_transfers(usb_dev);
 

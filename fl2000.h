@@ -176,6 +176,7 @@ int fl2000_usb_magic(struct usb_device *usb_dev);
 int fl2000_afe_magic(struct usb_device *usb_dev);
 int fl2000_set_transfers(struct usb_device *usb_dev);
 int fl2000_set_pixfmt(struct usb_device *usb_dev, u32 bytes_pix);
+int fl2000_set_polarity(struct usb_device *usb_dev, bool hsync_positive, bool vsync_positive);
 int fl2000_set_timings(struct usb_device *usb_dev, struct fl2000_timings *timings);
 int fl2000_set_pll(struct usb_device *usb_dev, struct fl2000_pll *pll);
 int fl2000_connector_sense(struct usb_device *usb_dev);
