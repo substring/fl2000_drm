@@ -81,6 +81,8 @@ struct fl2000_devs {
 	 * lingering-fd pattern works as intended
 	 */
 	struct device *drm_master;
+
+	struct fl2000_debugfs *debugfs;
 };
 
 static struct component_master_ops fl2000_master_ops = {
@@ -135,6 +137,9 @@ static struct fl2000_devs *fl2000_get_devices(struct usb_device *usb_dev)
 
 	component_match_add(&devs->adapter->dev, &devs->match, fl2000_compare, NULL);
 
+	/* Diagnostics only: a failure here must not stop the display coming up */
+	devs->debugfs = fl2000_debugfs_init(usb_dev);
+
 	dev_set_drvdata(&usb_dev->dev, devs);
 
 	return devs;
@@ -148,6 +153,8 @@ static void fl2000_put_devices(struct usb_device *usb_dev, struct fl2000_devs *d
 {
 	/* Stop anyone finding a stale devs on the next probe */
 	dev_set_drvdata(&usb_dev->dev, NULL);
+
+	fl2000_debugfs_cleanup(devs->debugfs);
 
 	/* Drops the component match devres along with the adapter device */
 	fl2000_i2c_cleanup(devs->adapter);

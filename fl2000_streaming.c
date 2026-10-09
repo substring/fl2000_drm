@@ -46,6 +46,16 @@ struct fl2000_stream {
 	struct semaphore work_sem;
 	bool enabled;
 	struct usb_anchor anchor;
+
+	/* Frame pacing statistics, under list_lock. The chip has no frame memory, so a frame URB
+	 * completes only as fast as the timing generator consumes it: completions tick at the
+	 * real refresh rate
+	 */
+	u64 stat_count;
+	u64 stat_first_ns;
+	u64 stat_last_ns;
+	unsigned int stat_head;
+	u64 stat_ring[FL2000_FRAME_RING];
 };
 
 static void fl2000_free_sb(struct fl2000_stream_buf *sb)
@@ -160,6 +170,16 @@ static void fl2000_stream_data_completion(struct urb *urb)
 
 		spin_lock_irqsave(&stream->list_lock, flags);
 		list_move_tail(&cur_sb->list, &stream->render_list);
+		if (!urb->status) {
+			u64 now = ktime_get_ns();
+
+			if (!stream->stat_count)
+				stream->stat_first_ns = now;
+			stream->stat_last_ns = now;
+			stream->stat_ring[stream->stat_head] = now;
+			stream->stat_head = (stream->stat_head + 1) % FL2000_FRAME_RING;
+			stream->stat_count++;
+		}
 		spin_unlock_irqrestore(&stream->list_lock, flags);
 
 		drm_crtc_handle_vblank(stream->crtc);
@@ -458,6 +478,46 @@ struct fl2000_stream *fl2000_stream_create(struct usb_device *usb_dev, struct dr
 	}
 
 	return stream;
+}
+
+static struct fl2000_stream *fl2000_stream_find(struct usb_device *usb_dev)
+{
+	return devres_find(&usb_dev->dev, fl2000_stream_release, NULL, NULL);
+}
+
+int fl2000_stream_get_stats(struct usb_device *usb_dev, struct fl2000_frame_stats *stats)
+{
+	struct fl2000_stream *stream = fl2000_stream_find(usb_dev);
+	unsigned int len;
+
+	if (!stream)
+		return -ENODEV;
+
+	spin_lock_irq(&stream->list_lock);
+	stats->count = stream->stat_count;
+	stats->first_ns = stream->stat_first_ns;
+	stats->last_ns = stream->stat_last_ns;
+	len = min_t(u64, stream->stat_count, FL2000_FRAME_RING);
+	stats->ring_len = len;
+	for (unsigned int i = 0; i < len; i++)
+		stats->ring[i] = stream->stat_ring[(stream->stat_head + FL2000_FRAME_RING - len + i) %
+						   FL2000_FRAME_RING];
+	spin_unlock_irq(&stream->list_lock);
+
+	return 0;
+}
+
+void fl2000_stream_reset_stats(struct usb_device *usb_dev)
+{
+	struct fl2000_stream *stream = fl2000_stream_find(usb_dev);
+
+	if (!stream)
+		return;
+
+	spin_lock_irq(&stream->list_lock);
+	stream->stat_count = 0;
+	stream->stat_head = 0;
+	spin_unlock_irq(&stream->list_lock);
 }
 
 void fl2000_stream_destroy(struct usb_device *usb_dev)

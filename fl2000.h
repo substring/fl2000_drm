@@ -22,6 +22,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/time.h>
 #include <linux/device.h>
+#include <linux/debugfs.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_prime.h>
 #include <drm/drm_vblank.h>
@@ -186,6 +187,27 @@ void fl2000_dump_regs(struct usb_device *usb_dev);
 int fl2000_enable_interrupts(struct usb_device *usb_dev);
 int fl2000_check_interrupt(struct usb_device *usb_dev);
 int fl2000_i2c_dword(struct usb_device *usb_dev, bool read, u16 addr, u8 offset, u32 *data);
+int fl2000_reg_raw_read(struct usb_device *usb_dev, u32 reg, u32 *val);
+int fl2000_reg_raw_write(struct usb_device *usb_dev, u32 reg, u32 val);
+
+/* Frame pacing statistics, gathered from stream URB completions */
+#define FL2000_FRAME_RING 1024
+
+struct fl2000_frame_stats {
+	u64 count;	/* completions since the last reset */
+	u64 first_ns;	/* timestamp of the first completion since the last reset */
+	u64 last_ns;	/* timestamp of the latest completion */
+	unsigned int ring_len;
+	u64 ring[FL2000_FRAME_RING]; /* latest completion timestamps, oldest first */
+};
+
+int fl2000_stream_get_stats(struct usb_device *usb_dev, struct fl2000_frame_stats *stats);
+void fl2000_stream_reset_stats(struct usb_device *usb_dev);
+
+/* Debugfs interface, see fl2000_debugfs.c */
+struct fl2000_debugfs;
+struct fl2000_debugfs *fl2000_debugfs_init(struct usb_device *usb_dev);
+void fl2000_debugfs_cleanup(struct fl2000_debugfs *dbg);
 
 /* I2C address of the monitor's DDC/EDID EEPROM, reached over the FL2000's own I2C master */
 #define FL2000_DDC_ADDR 0x50

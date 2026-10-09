@@ -79,6 +79,35 @@ static int fl2000_reg_write(void *context, unsigned int reg, unsigned int val)
 	return ret;
 }
 
+/* Uncached register access for the debugfs interface. Goes straight to the chip, then drops the
+ * register from the regmap cache so later regmap_update_bits() calls do not resurrect a stale
+ * value over whatever was poked in
+ */
+int fl2000_reg_raw_read(struct usb_device *usb_dev, u32 reg, u32 *val)
+{
+	unsigned int v;
+	int ret;
+
+	ret = fl2000_reg_read(usb_dev, reg, &v);
+	if (!ret)
+		*val = v;
+
+	return ret;
+}
+
+int fl2000_reg_raw_write(struct usb_device *usb_dev, u32 reg, u32 val)
+{
+	struct regmap *regmap = dev_get_regmap(&usb_dev->dev, NULL);
+	int ret;
+
+	ret = fl2000_reg_write(usb_dev, reg, val);
+
+	if (regmap)
+		regcache_drop_region(regmap, reg, reg);
+
+	return ret;
+}
+
 /* We do not use default values as per documentation because:
  *  a) somehow they differ from real HW
  *  b) on SW reset not all of them are cleared
