@@ -7,6 +7,7 @@
  *          register, freshly read from the chip
  *  dump    read the whole control register space, bypassing the regmap cache
  *  frames  read frame pacing statistics from stream URB completions; write anything to reset
+ *  ring    read the latest raw completion timestamps (ns), one per line, oldest first
  *  pokes   bit overrides applied during every modeset, before the chip reset and again at the
  *          end: write "REG SETMASK CLRMASK" to add one, "clear" to drop them all; read lists them.
  *          For bits that only latch on reset, which live register writes cannot reveal
@@ -269,6 +270,26 @@ static const struct file_operations fl2000_debugfs_frames_fops = {
 	.release = single_release,
 };
 
+static int fl2000_debugfs_ring_show(struct seq_file *s, void *unused)
+{
+	struct fl2000_debugfs *dbg = s->private;
+	struct fl2000_frame_stats *stats;
+	int ret;
+
+	stats = kvmalloc(sizeof(*stats), GFP_KERNEL);
+	if (!stats)
+		return -ENOMEM;
+
+	ret = fl2000_stream_get_stats(dbg->usb_dev, stats);
+	if (!ret)
+		for (unsigned int i = 0; i < stats->ring_len; i++)
+			seq_printf(s, "%llu\n", stats->ring[i]);
+
+	kvfree(stats);
+	return ret;
+}
+DEFINE_SHOW_ATTRIBUTE(fl2000_debugfs_ring);
+
 /* Not devres managed on the USB device: that outlives this module, see fl2000_put_devices() */
 struct fl2000_debugfs *fl2000_debugfs_init(struct usb_device *usb_dev)
 {
@@ -289,6 +310,7 @@ struct fl2000_debugfs *fl2000_debugfs_init(struct usb_device *usb_dev)
 	debugfs_create_file("dump", 0400, dbg->dir, dbg, &fl2000_debugfs_dump_fops);
 	debugfs_create_file("frames", 0600, dbg->dir, dbg, &fl2000_debugfs_frames_fops);
 	debugfs_create_file("pokes", 0600, dbg->dir, dbg, &fl2000_debugfs_pokes_fops);
+	debugfs_create_file("ring", 0400, dbg->dir, dbg, &fl2000_debugfs_ring_fops);
 
 	return dbg;
 }
