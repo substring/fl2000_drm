@@ -461,6 +461,9 @@ static void fl2000_display_enable(struct drm_simple_display_pipe *pipe,
 	UNUSED(cstate);
 	UNUSED(plane_state);
 
+	if (!drm_if->stream)
+		return;
+
 	fl2000_stream_enable(drm_if->stream);
 
 	drm_crtc_vblank_on(crtc);
@@ -479,7 +482,8 @@ static void fl2000_display_disable(struct drm_simple_display_pipe *pipe)
 	 */
 	drm_crtc_vblank_off(crtc);
 
-	fl2000_stream_disable(drm_if->stream);
+	if (drm_if->stream)
+		fl2000_stream_disable(drm_if->stream);
 }
 
 static void fb2000_dirty(struct drm_framebuffer *fb, struct drm_rect *rect)
@@ -492,6 +496,9 @@ static void fb2000_dirty(struct drm_framebuffer *fb, struct drm_rect *rect)
 	struct iosys_map data[DRM_FORMAT_MAX_PLANES];
 
 	UNUSED(rect);
+
+	if (!drm_if->stream)
+		return;
 
 	if (!drm_dev_enter(fb->dev, &idx)) {
 		dev_err(drm->dev, "DRM enter failed!");
@@ -609,7 +616,8 @@ static void fl2000_output_mode_set(struct drm_encoder *encoder, struct drm_displ
 	/* And again, in case the reset or the setup above cleared them */
 	fl2000_debugfs_apply_pokes(usb_dev);
 
-	fl2000_stream_mode_set(drm_if->stream, mode->hdisplay * mode->vdisplay, bytes_pix);
+	if (drm_if->stream)
+		fl2000_stream_mode_set(drm_if->stream, mode->hdisplay * mode->vdisplay, bytes_pix);
 }
 
 /* FL2000 HW control functions: mode configuration, turn on/off */
@@ -628,12 +636,6 @@ static void fl2000_drm_if_release(struct fl2000_drm_if *drm_if, struct device *m
 	if (!fl2000_vga_mode)
 		component_unbind_all(master, drm);
 
-	/* Stop streaming interface */
-	fl2000_stream_destroy(usb_dev);
-
-	/* Stop interrupts interface */
-	fl2000_intr_destroy(usb_dev);
-
 	/* Prepare to DRM device shutdown. The atomic shutdown must run HERE, while the device
 	 * is still alive - not from the .release callback where the refcount is already zero.
 	 * The pipe callbacks fail fast against an already-removed USB device, so this is safe
@@ -642,6 +644,18 @@ static void fl2000_drm_if_release(struct fl2000_drm_if *drm_if, struct device *m
 	drm_kms_helper_poll_fini(drm);
 	drm_atomic_helper_shutdown(drm);
 	drm_dev_unplug(drm);
+
+	/* Only now tear the stream down: the atomic shutdown above disables the pipe, which
+	 * stops the stream. Destroying it first left drm_if->stream dangling, and the shutdown
+	 * crashed in fl2000_stream_disable() - seen when usb-storage reset the dongle for its
+	 * driver CD interface, which forces an unbind
+	 */
+	drm_if->stream = NULL;
+	fl2000_stream_destroy(usb_dev);
+
+	/* Stop interrupts interface */
+	drm_if->intr = NULL;
+	fl2000_intr_destroy(usb_dev);
 
 	drm_edid_free(drm_if->drm_edid);
 	drm_if->drm_edid = NULL;
