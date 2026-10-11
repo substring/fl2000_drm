@@ -31,6 +31,12 @@
  * with all 8 cores saturated plus disk writes: no frame lost at depth 1. Deeper queues remain
  * selectable as a fallback
  */
+/* Diagnostics: per-frame content hash and log of what was sent (debugfs "sent") */
+static bool fl2000_debug_frames;
+module_param_named(debug_frames, fl2000_debug_frames, bool, 0644);
+MODULE_PARM_DESC(debug_frames, "Hash every frame and log what is sent, for debugfs \"sent\" "
+		 "(default 0)");
+
 static unsigned int fl2000_queue_depth = 1;
 module_param_named(queue_depth, fl2000_queue_depth, uint, 0644);
 MODULE_PARM_DESC(queue_depth, "Frames queued to the chip, 1-3 (default 1, lowest latency), "
@@ -302,6 +308,9 @@ static void fl2000_stream_record_sent(struct fl2000_stream *stream,
 {
 	struct fl2000_sent_frame *f = &stream->sent[stream->sent_head];
 
+	if (!fl2000_debug_frames)
+		return;
+
 	f->ns = ktime_get_ns();
 	f->ready_ns = sb->ready_ns;
 	f->seq = sb->seq;
@@ -564,9 +573,12 @@ void fl2000_stream_compress(struct fl2000_stream *stream, const struct iosys_map
 	kfree(line);
 
 	/* Sampled FNV-1a hash: cheap, and enough to tell frames apart in the debug log */
-	cur_sb->hash = 2166136261u;
-	for (size_t i = 0; i < stream->buf_size; i += 97)
-		cur_sb->hash = (cur_sb->hash ^ ((u8 *)cur_sb->vaddr)[i]) * 16777619u;
+	cur_sb->hash = 0;
+	if (fl2000_debug_frames) {
+		cur_sb->hash = 2166136261u;
+		for (size_t i = 0; i < stream->buf_size; i += 97)
+			cur_sb->hash = (cur_sb->hash ^ ((u8 *)cur_sb->vaddr)[i]) * 16777619u;
+	}
 
 	spin_lock_irqsave(&stream->list_lock, flags);
 	cur_sb->seq = ++stream->frame_seq;

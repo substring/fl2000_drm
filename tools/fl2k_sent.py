@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: GPL-2.0
 """Analyse what the FL2000 actually sent, frame by frame (debugfs "sent").
 
-Run as root while something updates the display, for example:
+Run as root with the debug_frames module parameter set while something updates the display,
+for example:
 
+    echo 1 | sudo tee /sys/module/fl2000/parameters/debug_frames
     sudo ./fl2k_mode -a 50 -t 8 6.7596 320 352 383 430 240 241 244 262 -hsync -vsync &
     sleep 3; sudo ./fl2k_sent.py
 
@@ -31,7 +33,8 @@ def main():
     frames = [(int(ns), int(seq), h, kind) for ns, seq, h, kind, _ in rows]
     waits = sorted((int(r[0]) - int(r[4])) / 1e6 for r in rows if r[3] == "new" and int(r[4]))
     if len(frames) < 2:
-        sys.exit("not enough frames")
+        sys.exit("not enough frames (frames are only logged with "
+                 "/sys/module/fl2000/parameters/debug_frames set to 1)")
 
     new = sum(1 for f in frames if f[3] == "new")
     rep = len(frames) - new

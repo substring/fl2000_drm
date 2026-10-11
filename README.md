@@ -1,3 +1,120 @@
+# 15 kHz CRT support (branch `15khz`)
+
+This branch turns an FL2000DX USB-to-VGA dongle into a **15 kHz RGB output for
+a CRT TV or arcade monitor**, for use with GroovyMAME, Switchres and
+GroovyArcade. It builds on the VGA support described further down.
+
+### What works
+
+- **Progressive 15 kHz modes**, any width: 240p/288p at native resolutions,
+  super resolutions such as 2560x240, all timings as Switchres computes them.
+  On a CRT TV the picture is stable, horizontally centred to the pixel.
+- **GPU rendering under X**: the main GPU renders and the dongle displays
+  (reverse PRIME), so Attract-Mode Plus, GroovyMAME and the desktop run
+  accelerated on the dongle.
+- **About one frame of latency**, with page flip events completed when the
+  frame starts on screen (60.005-60.01 Hz, 0.1 ms jitter).
+- **A protected screen**: in CRT mode the driver refuses anything outside
+  14.5-16.8 kHz, whatever asks for it.
+
+### What does not
+
+- **Interlace (480i/576i).** The chip's timing generator always starts vsync
+  on a line boundary. Every writable reserved bit was scanned, live and across
+  a chip reset, without finding an interlace mode; see the 15 kHz chapter of
+  [NOTES.md](NOTES.md).
+- **Accelerated rendering in KMS mode.** The dongle has no GPU, and
+  applications that render with OpenGL on the display device itself (SFML or
+  SDL in KMS/DRM mode) only get software rendering (llvmpipe). Use X.
+
+### Setup
+
+1. **Build and install** with DKMS (a `dkms.conf` is in the repository):
+   copy the tree to `/usr/src/fl2000_drm-<version>`, then
+   `dkms add fl2000_drm/<version>` and `dkms install fl2000_drm/<version>`.
+
+2. **Module options**, in `/etc/modprobe.d/fl2000.conf`:
+
+   ```
+   options fl2000 vga_mode=1 crt15k=1
+   # The dongle also exposes a driver CD. usb-storage's SCSI error handling
+   # resets the whole USB device, display included: keep it off the dongle
+   options usb-storage quirks=1d5c:2000:i
+   ```
+
+   When `usb_storage` is in the initramfs (it usually is), regenerate it so
+   the quirk applies at boot (`mkinitcpio -P` on Arch).
+
+3. **Modes calibrated for the screen** (recommended). The built-in mode list
+   has generic timings that are off-centre on a given TV. Let Switchres
+   generate an EDID from the screen's calibrated `crt_range`, install it, and
+   give it to the connector on the kernel command line:
+
+   ```
+   switchres 640 240 60 -e        # writes custom.bin with the user's switchres.ini
+   install -m 644 custom.bin /usr/lib/firmware/edid/fl2000_640x240.bin
+   ```
+
+   ```
+   video=VGA-1:e drm.edid_firmware=VGA-1:edid/fl2000_640x240.bin
+   ```
+
+   `drm.edid_firmware` takes one comma-separated list for all connectors (a
+   second occurrence replaces the first), while `video=` is repeated, one per
+   connector. The EDID must contain a progressive mode: an interlaced one is
+   dropped and the built-in list is used instead.
+
+4. **X**: the dongle appears as a "Sink Output" provider associated with the
+   main GPU. Its output starts disabled, so turn it on before starting
+   anything fullscreen, and make it primary: SFML (Attract-Mode) takes its
+   fullscreen mode list from the primary output and aborts on an empty one.
+   For example in `~/.xinitrc`:
+
+   ```
+   primary=--primary
+   for out in $(xrandr | awk '/ connected/ {print $1}') ; do
+     xrandr --output "$out" --auto $primary
+     primary=
+   done
+   ```
+
+   On GroovyArcade, also set `video.backend=X` in `ga.conf`.
+
+### Module parameters
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `vga_mode` | 0 | Drive the integrated VGA DAC (needed for VGA dongles) |
+| `crt15k` | 0 | 15 kHz CRT mode: 15 kHz modes only, from the EDID when it has a progressive 15 kHz one, else built in; everything outside 14.5-16.8 kHz refused |
+| `queue_depth` | 1 | Transfers queued to the chip (1-3). Each one beyond the first is a frame of latency; raise it only if frames ever go black |
+| `debug_frames` | 0 | Hash every frame and log what is sent (debugfs `sent`) |
+| `test_fill` | 0 | Stream solid white instead of the framebuffer, to test the data path |
+
+### Diagnostics
+
+A debugfs directory per dongle, `/sys/kernel/debug/fl2000-<usb device>/`,
+gives raw register access (`reg`, `dump`), frame pacing measured from the
+chip (`frames`, `ring`), the frames actually sent (`sent`, with
+`debug_frames=1`) and bit overrides applied around each modeset (`pokes`).
+The chip has no frame memory, so its transfers complete at the real refresh
+rate and serve as a timing instrument. Tools in `tools/` use them:
+
+- `fl2k_mode`: set any modeline with a test pattern; `-a FPS` animates
+  through DirtyFB like X does, `-f` page flips with events and reports their
+  timing.
+- `fl2k_measure.py`: measured frame period against the programmed timings.
+- `fl2k_sent.py`: new, repeated, out-of-order and lost frames, and waits.
+- `fl2k_scan.py`, `fl2k_fsync.py`: the register bit scans behind the
+  interlace search.
+- `fl2k_primetest`: checks that GPU buffers import into the dongle.
+
+### Tested on
+
+One FL2000DX VGA dongle (`1d5c:2000`) on an HP EliteDesk 705 G4 (AMD Vega 11),
+Arch Linux / GroovyArcade, kernels 7.2.9 and 6.18 LTS, with a 15 kHz CRT TV.
+
+---
+
 # FL2000DX VGA dongle support (fork)
 
 This is a fork of [klogg/fl2000_drm](https://github.com/klogg/fl2000_drm) that
@@ -44,7 +161,7 @@ Requirements: kernel headers and build tools (`build-essential`,
 
 ```
 make
-sudo modprobe drm_dma_helper
+sudo modprobe drm_shmem_helper
 sudo insmod fl2000.ko vga_mode=1
 ```
 

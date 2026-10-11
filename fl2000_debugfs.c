@@ -10,7 +10,7 @@
  *  ring    read the latest raw completion timestamps (ns), one per line, oldest first
  *  sent    read the latest frames sent, oldest first: "ns seq hash new|rep ready_ns", after a
  *          header with the frames rendered, dropped and superseded so far (reset through
- *          "frames")
+ *          "frames"). Frames are only logged with the debug_frames module parameter set
  *  pokes   bit overrides applied during every modeset, before the chip reset and again at the
  *          end: write "REG SETMASK CLRMASK" to add one, "clear" to drop them all; read lists them.
  *          For bits that only latch on reset, which live register writes cannot reveal

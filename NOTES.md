@@ -744,8 +744,157 @@ needs a working USB-3 port; nothing arrived for the driver to probe.
 - regmap debugfs exists at `/sys/kernel/debug/regmap/2-4/` but is of limited
   use: `registers` is read-only and dumping it would issue ~16384 USB control
   transfers (`max_register = 0xFFFF`, stride 4). There is no register-write
-  file. Add `dev_dbg()` to the driver instead.
+  file. The driver's own debugfs (`/sys/kernel/debug/fl2000-<usb device>/`,
+  see the 15 kHz chapter below) has uncached `reg` and `dump` files instead.
 - The driver is almost entirely silent by default. Enable dynamic debug:
       echo 'module fl2000 +p' | sudo tee /sys/kernel/debug/dynamic_debug/control
-- `fl2000.ko` depends on `drm_dma_helper`; `modprobe drm_dma_helper` first when
-  using `insmod`.
+- `fl2000.ko` depends on `drm_shmem_helper` (it used `drm_dma_helper` before
+  the move to shmem buffers); `modprobe drm_shmem_helper` first when using
+  `insmod`.
+
+---
+
+# 15 kHz work (branch `15khz`)
+
+Target: a 15 kHz CRT TV fed by the dongle, for GroovyMAME / GroovyArcade. Test
+machine: HP EliteDesk 705 G4 (AMD Vega 11, AMD IOMMU), Arch Linux, kernels
+7.2.9 and 6.18 LTS. No measuring instruments besides the TV and a trained eye,
+so the chip itself was made the instrument.
+
+## The chip as a timing instrument
+
+The FL2000 has no frame memory: the host streams every frame, and a bulk
+transfer completes only as fast as the timing generator consumes it. URB
+completion timestamps therefore tick at the real refresh rate. Averaged over a
+few hundred frames, the measured period matched the programmed timings within
+about -10 ppm (the crystal offset) on 640x480, 1024x768, 320x240, 640x240 and
+2560x240; per-frame jitter is around 25-100 us (USB). Half a line on a 262 line
+mode is 1900 ppm, so any interlace-like timing change would stand out.
+
+A second, independent instrument: `0x8040` counts pixel clocks over a window
+set in `0x8044` in 125 us units (8000 = one second by default). Read it a
+second after a change. Pulsing `0x8004` bit 28 clears it, and the counter then
+stays at 0 until re-armed through `0x803C` bit 14, as the Windows driver does
+in its htotal calibration routine.
+
+Timing registers `0x8008`-`0x8014` take effect live, with no reset: `vtotal`+1
+gave exactly +3817 ppm. The PLL (`0x802C`) does not: it latches on the chip
+reset in the modeset sequence.
+
+## Windows driver (static analysis)
+
+`fl2000.sys` 2.1.36287 (2020), extracted from the Advanced Installer package:
+the MSI and CAB payloads are stored with their first 512 bytes XORed with
+0xFF. Findings:
+
+- Modes come only from a fixed table of 72 VESA/CEA modes, at least 640 wide,
+  with no 15 kHz mode. 1024x768i@87 is programmed as progressive 1024x768@43.
+  Nothing in the table or code touches a reserved bit of the timing registers.
+- `hstart = hsync width + back porch + 1`, `vstart = vsync width + back porch
+  + 1`, `start_latency = vstart`: the timing generator counts from the sync
+  edge. This is what the driver's `htotal - hsync_start + 1` computes; all 438
+  table entries agree.
+- `vsync_width` is 4 bits (the 848x480 entry programs 8, bit 19), not 3.
+  `hsync_width` is at least 9 bits (2560x1600 programs 280, bit 24), not 8.
+- Sync polarity: `0x8004` bits 2/3 are cleared for 640x480@60 and set
+  otherwise.
+
+## Bugs found on the way to 15 kHz
+
+- **PLL divisor.** Only the low 6 bits of the divisor field reach the PLL. A
+  6.7 MHz mode with divisor 100 ran at 18.61 MHz (`0x8040`), the clock of 100 &
+  0x3f = 36: low pixel clocks, i.e. every 15 kHz mode, ran about 3x too fast.
+  The ASIC PLL values of the Windows table never exceed 61. Divisors now stop
+  at 63.
+- **Sync polarity** was never programmed and stayed at its reset value, both
+  bits set. The TV loses sync like that and syncs with both bits clear: 0 is
+  negative. The bits now follow the mode flags.
+- **Frames that are not a whole number of 1024 byte packets.** The chip does
+  not take a short final packet as the end of a frame: 224, 160 and 96 pixel
+  wide 240 line modes and 720x288 ran at about 88 Hz, while 128/192/256/320
+  were exact. Padding the frame to whole packets halves the rate instead (the
+  chip counts the extra bytes into the next frame). An explicit zero length
+  packet after such frames fixes it.
+- **usb-storage resets the dongle.** The dongle also exposes its driver CD.
+  The SCSI error handler resets the whole USB device, which force-unbinds the
+  display. Teardown then crashed: the stream was destroyed before the atomic
+  shutdown, whose pipe disable used it (NULL dereference in `drain_workqueue`,
+  machine wedged until a power cycle; even `sync` hangs then). Teardown order
+  fixed, and `usb-storage quirks=1d5c:2000:i` keeps the storage driver away.
+- **BUG_ON in the stream** when an fbdev restore raced with an unbind and
+  rebind, killing a kworker with every modeset lock held. Now a dropped frame.
+
+## Interlace search
+
+Interlace needs fields of N+0.5 lines, with vsync starting mid-line on every
+other field and a continuous hsync train. The timing generator starts vsync on
+a line boundary. Searches, all measured from completion timestamps per frame:
+
+- **Live bit scan** (`tools/fl2k_scan.py`) of every reserved bit of
+  `0x8004`-`0x8018` and every writable bit of the undocumented `0x8050`-`0x8088`
+  (writable: `0x8050`, `0x8060` low byte, `0x8064`, `0x8070`, `0x8074`,
+  `0x8078`, `0x8088` low half; `0x8088` and above mirror `0x88`). Borderline
+  results were re-measured over 6 s windows: all noise.
+- **The same bits forced through a modeset each** (`--modeset`, debugfs
+  `pokes` applied before the chip reset and at the end of the modeset), for
+  bits that would only latch on reset like the PLL: nothing.
+- **`0x8004` bit 1 (frame_sync)** is the only bit that changes the timing. With
+  it, the frame ends when the image data ends: `start_latency + vactive - 1`
+  lines (minus 0.03), whatever `vtotal` says, about 2300 lines when
+  `start_latency > vstart`, and odd fractions for some `vstart` values. Every
+  frame is identical. No odd/even combination of `vtotal`, `vactive` (field-
+  like 262/263, or frame-like 524/525 with vactive 480, the Switchres
+  `interlace_force_even` idea) and `vstart`/`start_latency` makes consecutive
+  frames alternate (`tools/fl2k_fsync.py`, per-frame analysis).
+- **Data-driven half lines**: one extra byte of frame data breaks the framing
+  altogether (the chip then consumes one pixel per clock with no blanking,
+  about 180.5 lines per transfer).
+
+Conclusion: no interlace reachable on this chip.
+
+## GPU rendering: shmem buffers and reverse PRIME
+
+The dongle has no GPU. In KMS mode, applications that create their OpenGL
+context on the display device (SFML, SDL KMSDRM) get llvmpipe. Under X, the
+main GPU renders and the dongle is a "Sink Output" provider.
+
+That needs the dongle to import the GPU's buffers. With GEM DMA buffers it
+could not: the DRM device sits on a USB interface with no DMA mask (WARN in
+`dma_map_sg`), and attached through the xHCI controller the mapping must be
+contiguous, which only an IOMMU translating for that controller provides (it
+is `identity` on the test machine). The chip is fed by the CPU anyway, so the
+driver moved to GEM shmem, whose PRIME import does not map the buffer for DMA
+at all, and reads frames through `drm_gem_fb_vmap()`. `tools/fl2k_primetest`
+checks the import.
+
+Under X every other frame was then black, at most 17 updates per second: the
+frame conversion ran with the stream spinlock held and interrupts off, reading
+the GPU's write-combined buffer at about 10 MB/s, 58-68 ms per frame. Transfers
+could not be resubmitted meanwhile and the chip blanked. The conversion now
+runs with the lock dropped and pulls each line with `drm_memcpy_from_wc()`
+(SSE4.1 streaming loads): 0.5-0.9 ms per frame, a new frame on every one of 60.
+
+## Latency and flip timing
+
+- Flip events used to be armed on the vblank counter, which needs accurate
+  vblank timestamps this device cannot provide (WARN). A frame starts on
+  screen when the transfer before it completes, so the event now travels with
+  its frame and is sent from that completion interrupt (or when the frame is
+  handed to the chip, at the latest).
+- Three transfers were kept queued: about 50 ms of latency, and holding the
+  event until the frame was on screen made the next nonblocking commit fail
+  with EBUSY. One queued transfer turned out to be enough: with all 8 cores
+  saturated and disk writes, no frame was lost (no completion interval above
+  17.7 ms). `queue_depth` keeps 2-3 as a fallback.
+- When several converted frames wait, only the newest is sent.
+- Page flips with events (`fl2k_mode -f`): 60.005-60.01 Hz, 0.08-0.1 ms
+  standard deviation idle, 0.46 ms under full CPU load.
+
+## Modes calibrated for the screen
+
+The built-in 15 kHz list has generic timings, off-centre on the test TV.
+`crt15k` now takes its modes from the EDID when it holds a progressive 15 kHz
+mode, which `drm.edid_firmware=VGA-1:...` provides. Switchres writes one from
+the user's calibrated range (`switchres 640 240 60 -e`). With it the console
+came up centred. An EDID holding only an interlaced mode (as made for a GPU
+output running 480i) is ignored in favour of the built-in list.
