@@ -19,7 +19,10 @@
  *  - one buffer for DRM/KMS data copy
  */
 #define FL2000_SB_MIN 3
-#define FL2000_SB_NUM (FL2000_SB_MIN + 1)
+/* Plus one being converted by fl2000_stream_compress() and one free, so the worker always has a
+ * buffer to resend the last frame into
+ */
+#define FL2000_SB_NUM (FL2000_SB_MIN + 2)
 
 #define FL2000_URB_TIMEOUT 100
 
@@ -282,6 +285,16 @@ static void fl2000_stream_work(struct work_struct *work)
 		/* If no buffers are available for immediate transmission - then copy latest
 		 * transmission data
 		 */
+		if (list_empty(&stream->transmit_list) && list_empty(&stream->render_list)) {
+			/* Every buffer is in flight or being converted: try again shortly rather
+			 * than lose this transmission slot for good
+			 */
+			spin_unlock_irqrestore(&stream->list_lock, flags);
+			usleep_range(500, 1000);
+			up(&stream->work_sem);
+			continue;
+		}
+
 		if (list_empty(&stream->transmit_list)) {
 			if (list_empty(&stream->wait_list))
 				last_sb = list_last_entry(&stream->render_list,
@@ -359,14 +372,22 @@ static void fl2000_xrgb888_to_rgb565_line(u16 *dbuf, u32 *sbuf, u32 pixels)
 	}
 }
 
-void fl2000_stream_compress(struct fl2000_stream *stream, void *src, unsigned int height,
-			    unsigned int width, unsigned int pitch)
+void fl2000_stream_compress(struct fl2000_stream *stream, const struct iosys_map *src_map,
+			    unsigned int height, unsigned int width, unsigned int pitch)
 {
 	struct fl2000_stream_buf *cur_sb;
-	void *dst;
+	struct iosys_map src = *src_map;
+	struct iosys_map line_map;
+	u32 *line = NULL;
+	u8 *dst;
 	u32 dst_line_len;
 	unsigned long flags;
 
+	/* Take a buffer off the free list and convert into it with the lock dropped and
+	 * interrupts on. Converting under the lock stalled URB completions and resubmission for
+	 * the whole conversion: 58-68 ms per frame when reading a PRIME buffer rendered by the
+	 * GPU, so the chip ran dry and showed every other frame black
+	 */
 	spin_lock_irqsave(&stream->list_lock, flags);
 
 	/* No buffer to render into: the stream is being torn down or rebuilt (seen when the device
@@ -380,12 +401,27 @@ void fl2000_stream_compress(struct fl2000_stream *stream, void *src, unsigned in
 	}
 
 	cur_sb = list_first_entry(&stream->render_list, struct fl2000_stream_buf, list);
+	list_del_init(&cur_sb->list);
+	spin_unlock_irqrestore(&stream->list_lock, flags);
+
 	dst = cur_sb->vaddr;
 	dst_line_len = width * stream->bytes_pix;
 
 	/* The buffer is sized for the mode, the copy for the framebuffer: never write past it */
 	if (dst_line_len && height * dst_line_len > stream->buf_size)
 		height = stream->buf_size / dst_line_len;
+
+	if (!fl2000_test_fill) {
+		line = kmalloc_array(width, sizeof(*line), GFP_KERNEL);
+		if (!line) {
+			spin_lock_irqsave(&stream->list_lock, flags);
+			list_add(&cur_sb->list, &stream->render_list);
+			stream->dropped++;
+			spin_unlock_irqrestore(&stream->list_lock, flags);
+			return;
+		}
+		iosys_map_set_vaddr(&line_map, line);
+	}
 
 	if (fl2000_test_fill) {
 		/* Diagnostic: ignore the framebuffer and transmit solid white. The chip paces
@@ -397,28 +433,36 @@ void fl2000_stream_compress(struct fl2000_stream *stream, void *src, unsigned in
 		memset(dst, 0xff, stream->buf_size);
 	} else {
 		for (unsigned int y = 0; y < height; y++) {
+			/* A buffer rendered by the GPU is write-combined: plain CPU reads of it run
+			 * at about 10 MB/s. Pull each line with streaming loads into cached memory
+			 * first, then convert from there
+			 */
+			drm_memcpy_from_wc(&line_map, &src, width * sizeof(*line));
+			iosys_map_incr(&src, pitch);
+
 			switch (stream->bytes_pix) {
 			case 2:
-				fl2000_xrgb888_to_rgb565_line(dst, src, width);
+				fl2000_xrgb888_to_rgb565_line((u16 *)dst, line, width);
 				break;
 			case 3:
-				fl2000_xrgb888_to_rgb888_line(dst, src, width);
+				fl2000_xrgb888_to_rgb888_line(dst, line, width);
 				break;
 			default: /* Shouldn't happen */
 				break;
 			}
-			src += pitch;
 			dst += dst_line_len;
 		}
 	}
+	kfree(line);
 
 	/* Sampled FNV-1a hash: cheap, and enough to tell frames apart in the debug log */
 	cur_sb->hash = 2166136261u;
 	for (size_t i = 0; i < stream->buf_size; i += 97)
 		cur_sb->hash = (cur_sb->hash ^ ((u8 *)cur_sb->vaddr)[i]) * 16777619u;
-	cur_sb->seq = ++stream->frame_seq;
 
-	list_move_tail(&cur_sb->list, &stream->transmit_list);
+	spin_lock_irqsave(&stream->list_lock, flags);
+	cur_sb->seq = ++stream->frame_seq;
+	list_add_tail(&cur_sb->list, &stream->transmit_list);
 	spin_unlock_irqrestore(&stream->list_lock, flags);
 }
 

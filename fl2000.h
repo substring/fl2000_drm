@@ -40,6 +40,8 @@
 #include <drm/drm_crtc_helper.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_edid.h>
+#include <drm/drm_cache.h>
+#include <linux/iosys-map.h>
 #include <drm/drm_damage_helper.h>
 
 #include "fl2000_registers.h"
@@ -151,8 +153,8 @@ void fl2000_stream_destroy(struct usb_device *usb_dev);
 
 /* Streaming interface */
 int fl2000_stream_mode_set(struct fl2000_stream *stream, int pixels, u32 bytes_pix);
-void fl2000_stream_compress(struct fl2000_stream *stream, void *src, unsigned int height,
-			    unsigned int width, unsigned int pitch);
+void fl2000_stream_compress(struct fl2000_stream *stream, const struct iosys_map *src_map,
+			    unsigned int height, unsigned int width, unsigned int pitch);
 int fl2000_stream_enable(struct fl2000_stream *stream);
 void fl2000_stream_disable(struct fl2000_stream *stream);
 

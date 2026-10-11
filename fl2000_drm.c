@@ -512,7 +512,7 @@ static void fb2000_dirty(struct drm_framebuffer *fb, struct drm_rect *rect)
 
 	ret = drm_gem_fb_begin_cpu_access(fb, DMA_FROM_DEVICE);
 	if (!ret) {
-		fl2000_stream_compress(drm_if->stream, data[0].vaddr, fb->height, fb->width,
+		fl2000_stream_compress(drm_if->stream, &data[0], fb->height, fb->width,
 				       fb->pitches[0]);
 		drm_gem_fb_end_cpu_access(fb, DMA_FROM_DEVICE);
 	}
