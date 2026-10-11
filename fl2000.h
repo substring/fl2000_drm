@@ -208,13 +208,16 @@ int fl2000_stream_get_stats(struct usb_device *usb_dev, struct fl2000_frame_stat
 /* One frame as it went out on the wire */
 struct fl2000_sent_frame {
 	u64 ns;		/* submission time */
+	u64 ready_ns;	/* when the frame was converted and ready to go */
 	u32 seq;	/* frame number from fl2000_stream_compress() */
 	u32 hash;	/* sampled content hash */
 	bool repeat;	/* no new frame was ready: the previous one was sent again */
 };
 
 int fl2000_stream_get_sent(struct usb_device *usb_dev, struct fl2000_sent_frame *out,
-			   unsigned int *len, u64 *dropped, u32 *frame_seq);
+			   unsigned int *len, u64 *dropped, u64 *superseded, u32 *frame_seq);
+void fl2000_stream_queue_event(struct fl2000_stream *stream,
+			       struct drm_pending_vblank_event *event);
 void fl2000_stream_reset_stats(struct usb_device *usb_dev);
 
 /* Debugfs interface, see fl2000_debugfs.c */

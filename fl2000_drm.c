@@ -549,6 +549,7 @@ static void fl2000_display_update(struct drm_simple_display_pipe *pipe,
 	struct drm_device *drm = crtc->dev;
 	struct drm_pending_vblank_event *event = crtc->state->event;
 	struct drm_plane_state *state = pipe->plane.state;
+	struct fl2000_drm_if *drm_if = drm->dev_private;
 	struct drm_rect rect;
 
 	if (drm_atomic_helper_damage_merged(old_state, state, &rect))
@@ -557,12 +558,16 @@ static void fl2000_display_update(struct drm_simple_display_pipe *pipe,
 	if (event) {
 		crtc->state->event = NULL;
 
-		spin_lock_irq(&drm->event_lock);
-		if (crtc->state->active && drm_crtc_vblank_get(crtc) == 0)
-			drm_crtc_arm_vblank_event(crtc, event);
-		else
+		/* Completed when the frame just converted (or the current one, if the picture did
+		 * not change) starts on screen
+		 */
+		if (crtc->state->active && drm_if->stream) {
+			fl2000_stream_queue_event(drm_if->stream, event);
+		} else {
+			spin_lock_irq(&drm->event_lock);
 			drm_crtc_send_vblank_event(crtc, event);
-		spin_unlock_irq(&drm->event_lock);
+			spin_unlock_irq(&drm->event_lock);
+		}
 	}
 }
 

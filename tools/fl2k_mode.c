@@ -2,15 +2,17 @@
 /*
  * Set an arbitrary modeline on the FL2000 and hold it, showing a test pattern.
  *
- *   fl2k_mode [-p pattern] [-t seconds] [-a fps] CLOCK_MHZ HDISP HSS HSE HTOT VDISP VSS VSE VTOT [FLAGS...]
+ *   fl2k_mode [-p pattern] [-t seconds] [-a fps | -f] CLOCK_MHZ HDISP HSS HSE HTOT VDISP VSS VSE VTOT [FLAGS...]
  *
  * The modeline uses the X11 syntax, FLAGS being any of +hsync -hsync +vsync -vsync interlace.
  * Patterns: lines (alternating 1-pixel white/black lines, the default), grid, white, bars.
  * The mode is held until the timeout expires, or until Enter/SIGINT without -t.
  * With -a, a vertical bar sweeps across the screen, redrawn in the single framebuffer and
  * flushed with DirtyFB fps times a second: the way X updates a PRIME sink output.
+ * With -f, the bar is page flipped between two framebuffers, each flip waiting for the
+ * previous one's event (vsync, as GroovyMAME does), and the event intervals are reported.
  *
- * Build: cc -O2 -o fl2k_mode fl2k_mode.c $(pkg-config --cflags --libs libdrm)
+ * Build: cc -O2 -o fl2k_mode fl2k_mode.c $(pkg-config --cflags --libs libdrm) -lm
  */
 
 #include <errno.h>
@@ -22,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <math.h>
 #include <time.h>
 #include <unistd.h>
 #include <xf86drm.h>
@@ -31,6 +34,23 @@
 #define DRIVER_NAME "fl2000_drm"
 
 static volatile sig_atomic_t quit;
+
+static void on_flip(int fd, unsigned int seq, unsigned int sec, unsigned int usec, void *data)
+{
+	(void)fd;
+	(void)seq;
+	(void)sec;
+	(void)usec;
+	*(int *)data = 1;
+}
+
+static double now_s(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec + ts.tv_nsec / 1e9;
+}
 
 static void on_signal(int sig)
 {
@@ -168,10 +188,11 @@ int main(int argc, char **argv)
 	uint32_t handles[4] = { 0 }, pitches[4] = { 0 }, offsets[4] = { 0 };
 	double timeout = -1;
 	double anim_fps = 0;
+	int flip = 0;
 	void *px;
 	int fd, opt, ret;
 
-	while ((opt = getopt(argc, argv, "+p:t:a:")) != -1) {
+	while ((opt = getopt(argc, argv, "+p:t:a:f")) != -1) {
 		switch (opt) {
 		case 'p':
 			pattern = optarg;
@@ -181,6 +202,9 @@ int main(int argc, char **argv)
 			break;
 		case 'a':
 			anim_fps = strtod(optarg, NULL);
+			break;
+		case 'f':
+			flip = 1;
 			break;
 		default:
 			usage();
@@ -251,7 +275,74 @@ int main(int argc, char **argv)
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
 
-	if (anim_fps > 0) {
+	if (flip) {
+		struct drm_mode_create_dumb c2 = { .width = mode.hdisplay, .height = mode.vdisplay,
+						   .bpp = 32 };
+		struct drm_mode_map_dumb m2 = { 0 };
+		uint32_t fbs[2] = { fb_id, 0 }, h2[4] = { 0 }, p2[4] = { 0 }, o2[4] = { 0 };
+		void *pxs[2] = { px, NULL };
+		drmEventContext ev = { .version = 2, .page_flip_handler = on_flip };
+		double t0 = now_s(), last = 0, sum = 0, sumsq = 0, mn = 1e9, mx = 0;
+		long flips = 0;
+
+		if (drmIoctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &c2)) {
+			perror("create second dumb");
+			return 1;
+		}
+		h2[0] = c2.handle;
+		p2[0] = c2.pitch;
+		if (drmModeAddFB2(fd, mode.hdisplay, mode.vdisplay, DRM_FORMAT_XRGB8888, h2, p2,
+				  o2, &fbs[1], 0)) {
+			perror("addfb second");
+			return 1;
+		}
+		m2.handle = c2.handle;
+		drmIoctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &m2);
+		pxs[1] = mmap(NULL, c2.size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, m2.offset);
+
+		while (!quit && (timeout < 0 || now_s() - t0 < timeout)) {
+			int back = (flips + 1) & 1, done = 0;
+			struct pollfd pfd = { .fd = fd, .events = POLLIN };
+
+			draw_bar(pxs[back], back ? c2.pitch : create.pitch, mode.hdisplay,
+				 mode.vdisplay, (int)((flips * 4) % mode.hdisplay));
+			if (drmModePageFlip(fd, crtc_id, fbs[back], DRM_MODE_PAGE_FLIP_EVENT, &done)) {
+				perror("page flip");
+				break;
+			}
+			while (!done && !quit) {
+				if (poll(&pfd, 1, 1000) <= 0) {
+					fprintf(stderr, "no flip event within 1 s\n");
+					quit = 1;
+					break;
+				}
+				drmHandleEvent(fd, &ev);
+			}
+			if (done) {
+				double t = now_s();
+
+				if (last > 0) {
+					double d = (t - last) * 1000;
+
+					sum += d;
+					sumsq += d * d;
+					mn = d < mn ? d : mn;
+					mx = d > mx ? d : mx;
+				}
+				last = t;
+				flips++;
+			}
+		}
+		if (flips > 2) {
+			double n = flips - 1, mean = sum / n;
+
+			fprintf(stderr, "%ld flips, interval mean %.3f ms (%.3f Hz), min %.3f, max %.3f, "
+				"stddev %.3f ms\n", flips, mean, 1000 / mean, mn, mx,
+				sqrt(sumsq / n - mean * mean));
+		}
+		drmModeSetCrtc(fd, crtc_id, fb_id, 0, 0, &conn_id, 1, &mode);
+		drmModeRmFB(fd, fbs[1]);
+	} else if (anim_fps > 0) {
 		struct timespec t0, now;
 		long frame = 0;
 

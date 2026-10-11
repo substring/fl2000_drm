@@ -26,6 +26,16 @@
 
 #define FL2000_URB_TIMEOUT 100
 
+/* Transfers kept queued to the chip. Each one beyond the first is a frame of latency; the
+ * risk of a single one is the chip running dry between two transfers. Measured on a FL2000DX
+ * with all 8 cores saturated plus disk writes: no frame lost at depth 1. Deeper queues remain
+ * selectable as a fallback
+ */
+static unsigned int fl2000_queue_depth = 1;
+module_param_named(queue_depth, fl2000_queue_depth, uint, 0644);
+MODULE_PARM_DESC(queue_depth, "Frames queued to the chip, 1-3 (default 1, lowest latency), "
+		 "applied when the display is next enabled");
+
 struct fl2000_stream_buf {
 	struct list_head list;
 	struct sg_table sgt;
@@ -34,6 +44,7 @@ struct fl2000_stream_buf {
 	void *vaddr;
 	u32 seq;	/* frame number given by fl2000_stream_compress(), 0 for none yet */
 	u32 hash;	/* sampled content hash, to tell frames apart in the debug log */
+	u64 ready_ns;	/* when the conversion finished */
 };
 
 struct fl2000_stream {
@@ -62,9 +73,14 @@ struct fl2000_stream {
 	unsigned int stat_head;
 	u64 stat_ring[FL2000_FRAME_RING];
 
+	/* Page flip event waiting for frame event_seq to reach the screen, under list_lock */
+	struct drm_pending_vblank_event *event;
+	u32 event_seq;
+
 	/* What was sent, frame by frame, under list_lock: debugfs "sent" */
 	u32 frame_seq;
 	u64 dropped;
+	u64 superseded;
 	unsigned int sent_head;
 	u64 sent_count;
 	struct fl2000_sent_frame sent[FL2000_FRAME_RING];
@@ -171,6 +187,63 @@ static void fl2000_stream_release(struct device *dev, void *res)
 	fl2000_stream_put_buffers(stream);
 }
 
+/* Under list_lock: take the pending event if frame seq, now starting on screen, carries it */
+static struct drm_pending_vblank_event *fl2000_stream_take_event(struct fl2000_stream *stream,
+								  u32 seq)
+{
+	struct drm_pending_vblank_event *event = stream->event;
+
+	if (!event || (s32)(seq - stream->event_seq) < 0)
+		return NULL;
+
+	stream->event = NULL;
+	return event;
+}
+
+static void fl2000_stream_send_event(struct fl2000_stream *stream,
+				     struct drm_pending_vblank_event *event)
+{
+	struct drm_device *drm = stream->crtc->dev;
+	unsigned long flags;
+
+	if (!event)
+		return;
+
+	spin_lock_irqsave(&drm->event_lock, flags);
+	drm_crtc_send_vblank_event(stream->crtc, event);
+	spin_unlock_irqrestore(&drm->event_lock, flags);
+}
+
+/**
+ * fl2000_stream_queue_event() - complete a page flip once its frame reaches the screen
+ * @stream: the stream
+ * @event: the event of the commit that just converted its frame, or of one that did not
+ *	   change the picture
+ *
+ * The chip has no frame memory: a frame starts on screen when the transfer before it
+ * completes. Sending the event then gives userspace honest flip timing, where arming it on
+ * the vblank counter needed accurate vblank timestamps this device cannot provide (and WARNed)
+ */
+void fl2000_stream_queue_event(struct fl2000_stream *stream, struct drm_pending_vblank_event *event)
+{
+	struct drm_pending_vblank_event *old;
+	unsigned long flags;
+
+	spin_lock_irqsave(&stream->list_lock, flags);
+	old = stream->event;
+	stream->event = event;
+	stream->event_seq = stream->frame_seq;
+	if (!stream->enabled)
+		event = fl2000_stream_take_event(stream, stream->event_seq);
+	else
+		event = NULL;
+	spin_unlock_irqrestore(&stream->list_lock, flags);
+
+	/* Commits wait for flip_done, so there is never an older one; be safe anyway */
+	fl2000_stream_send_event(stream, old);
+	fl2000_stream_send_event(stream, event);
+}
+
 static void fl2000_stream_data_completion(struct urb *urb)
 {
 	struct fl2000_stream_buf *cur_sb = urb->transfer_buffer;
@@ -180,8 +253,25 @@ static void fl2000_stream_data_completion(struct urb *urb)
 	if (stream) {
 		unsigned long flags;
 
+		struct drm_pending_vblank_event *event = NULL;
+
 		spin_lock_irqsave(&stream->list_lock, flags);
 		list_move_tail(&cur_sb->list, &stream->render_list);
+		/* Whatever goes out next is what the chip shows from now on: the next queued
+		 * transfer, or with nothing queued, the newest converted frame the worker is about
+		 * to submit. Completing the flip here, from the interrupt, keeps scheduling delays
+		 * of the worker out of the timing userspace sees
+		 */
+		if (!list_empty(&stream->wait_list))
+			event = fl2000_stream_take_event(stream,
+							 list_first_entry(&stream->wait_list,
+									  struct fl2000_stream_buf,
+									  list)->seq);
+		else if (!list_empty(&stream->transmit_list))
+			event = fl2000_stream_take_event(stream,
+							 list_last_entry(&stream->transmit_list,
+									 struct fl2000_stream_buf,
+									 list)->seq);
 		if (!urb->status) {
 			u64 now = ktime_get_ns();
 
@@ -195,6 +285,7 @@ static void fl2000_stream_data_completion(struct urb *urb)
 		spin_unlock_irqrestore(&stream->list_lock, flags);
 
 		drm_crtc_handle_vblank(stream->crtc);
+		fl2000_stream_send_event(stream, event);
 
 		/* Kick transmit workqueue */
 		up(&stream->work_sem);
@@ -212,6 +303,7 @@ static void fl2000_stream_record_sent(struct fl2000_stream *stream,
 	struct fl2000_sent_frame *f = &stream->sent[stream->sent_head];
 
 	f->ns = ktime_get_ns();
+	f->ready_ns = sb->ready_ns;
 	f->seq = sb->seq;
 	f->hash = sb->hash;
 	f->repeat = repeat;
@@ -258,6 +350,7 @@ static void fl2000_stream_work(struct work_struct *work)
 	struct usb_device *usb_dev = stream->usb_dev;
 	struct fl2000_stream_buf *cur_sb;
 	struct fl2000_stream_buf *last_sb;
+	struct drm_pending_vblank_event *event;
 	struct urb *data_urb;
 
 	while (stream->enabled) {
@@ -307,14 +400,29 @@ static void fl2000_stream_work(struct work_struct *work)
 			memcpy(cur_sb->vaddr, last_sb->vaddr, stream->buf_size);
 			cur_sb->seq = last_sb->seq;
 			cur_sb->hash = last_sb->hash;
+			cur_sb->ready_ns = last_sb->ready_ns;
 			fl2000_stream_record_sent(stream, cur_sb, true);
 		} else {
-			cur_sb = list_first_entry(&stream->transmit_list, struct fl2000_stream_buf,
-						  list);
+			/* Latest wins: frames that were overtaken before reaching the wire go back
+			 * to the free list instead of being shown late
+			 */
+			cur_sb = list_last_entry(&stream->transmit_list, struct fl2000_stream_buf,
+						 list);
+			while (list_first_entry(&stream->transmit_list, struct fl2000_stream_buf,
+						list) != cur_sb) {
+				list_move_tail(stream->transmit_list.next, &stream->render_list);
+				stream->superseded++;
+			}
 			fl2000_stream_record_sent(stream, cur_sb, false);
 		}
+		/* At the latest when its frame is handed to the chip: with a deeper queue that is a
+		 * frame or two before it shows, but waiting longer made the next nonblocking commit
+		 * fail with EBUSY, since a blocking one only waits for one vblank
+		 */
+		event = fl2000_stream_take_event(stream, cur_sb->seq);
 		list_move_tail(&cur_sb->list, &stream->wait_list);
 		spin_unlock_irqrestore(&stream->list_lock, flags);
+		fl2000_stream_send_event(stream, event);
 
 		data_urb = usb_alloc_urb(0, GFP_KERNEL);
 		if (!data_urb) {
@@ -462,6 +570,7 @@ void fl2000_stream_compress(struct fl2000_stream *stream, const struct iosys_map
 
 	spin_lock_irqsave(&stream->list_lock, flags);
 	cur_sb->seq = ++stream->frame_seq;
+	cur_sb->ready_ns = ktime_get_ns();
 	list_add_tail(&cur_sb->list, &stream->transmit_list);
 	spin_unlock_irqrestore(&stream->list_lock, flags);
 }
@@ -499,8 +608,11 @@ int fl2000_stream_mode_set(struct fl2000_stream *stream, int pixels, u32 bytes_p
 
 int fl2000_stream_enable(struct fl2000_stream *stream)
 {
-	BUG_ON(list_empty(&stream->transmit_list));
+	unsigned int depth = clamp(fl2000_queue_depth, 1U, (unsigned int)FL2000_SB_MIN);
 
+	/* Nothing converted yet is fine: the worker resends the last buffer, as it does whenever
+	 * no new frame is ready (this was a BUG_ON)
+	 */
 	/* The anchor is empty here; re-init clears any poisoned state a previous disable left
 	 * behind, which would otherwise auto-reject every URB of the new session
 	 */
@@ -510,7 +622,7 @@ int fl2000_stream_enable(struct fl2000_stream *stream)
 	queue_work(stream->work_queue, &stream->work);
 
 	/* Kick transmit workqueue with minimum buffers submitted */
-	for (int i = 0; i < FL2000_SB_MIN; i++)
+	for (unsigned int i = 0; i < depth; i++)
 		up(&stream->work_sem);
 
 	return 0;
@@ -518,6 +630,7 @@ int fl2000_stream_enable(struct fl2000_stream *stream)
 
 void fl2000_stream_disable(struct fl2000_stream *stream)
 {
+	struct drm_pending_vblank_event *event;
 	struct fl2000_stream_buf *cur_sb;
 
 	stream->enabled = false;
@@ -539,6 +652,13 @@ void fl2000_stream_disable(struct fl2000_stream *stream)
 		usb_poison_anchored_urbs(&stream->anchor);
 		usb_scuttle_anchored_urbs(&stream->anchor);
 	}
+
+	/* Nothing will reach the screen any more: complete a flip still waiting for it */
+	spin_lock_irq(&stream->list_lock);
+	event = stream->event;
+	stream->event = NULL;
+	spin_unlock_irq(&stream->list_lock);
+	fl2000_stream_send_event(stream, event);
 
 	spin_lock_irq(&stream->list_lock);
 	while (!list_empty(&stream->transmit_list)) {
@@ -630,7 +750,7 @@ int fl2000_stream_get_stats(struct usb_device *usb_dev, struct fl2000_frame_stat
 }
 
 int fl2000_stream_get_sent(struct usb_device *usb_dev, struct fl2000_sent_frame *out,
-			   unsigned int *len, u64 *dropped, u32 *frame_seq)
+			   unsigned int *len, u64 *dropped, u64 *superseded, u32 *frame_seq)
 {
 	struct fl2000_stream *stream = fl2000_stream_find(usb_dev);
 	unsigned int n;
@@ -645,6 +765,7 @@ int fl2000_stream_get_sent(struct usb_device *usb_dev, struct fl2000_sent_frame 
 				     FL2000_FRAME_RING];
 	*len = n;
 	*dropped = stream->dropped;
+	*superseded = stream->superseded;
 	*frame_seq = stream->frame_seq;
 	spin_unlock_irq(&stream->list_lock);
 
@@ -664,6 +785,7 @@ void fl2000_stream_reset_stats(struct usb_device *usb_dev)
 	stream->sent_count = 0;
 	stream->sent_head = 0;
 	stream->dropped = 0;
+	stream->superseded = 0;
 	spin_unlock_irq(&stream->list_lock);
 }
 
