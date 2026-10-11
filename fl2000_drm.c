@@ -183,15 +183,35 @@ static int fl2000_connector_get_modes(struct drm_connector *connector)
 	struct fl2000_drm_if *drm_if = container_of(connector, struct fl2000_drm_if, connector);
 	int count;
 
-	/* A TV has no EDID worth reading, and the VGA fallback list would be harmful */
-	if (fl2000_crt15k)
-		return fl2000_crt15k_get_modes(connector);
-
-	/* Re-read rather than cache: a VGA sink can be swapped without us being told */
+	/* Re-read rather than cache: a VGA sink can be swapped without us being told. This also
+	 * picks up an EDID given with drm.edid_firmware=VGA-1:..., which is how a TV gets modes
+	 * calibrated for it (Switchres can generate such an EDID)
+	 */
 	drm_edid_free(drm_if->drm_edid);
 	drm_if->drm_edid = drm_edid_read_custom(connector, fl2000_get_edid_block, drm_if);
 
 	drm_edid_connector_update(connector, drm_if->drm_edid);
+
+	if (fl2000_crt15k) {
+		struct drm_display_mode *mode;
+		bool usable = false;
+
+		/* Take the EDID modes if any of them is progressive 15 kHz; mode_valid() prunes the
+		 * rest. A PC monitor EDID or none at all: the built-in list, never the VGA fallback
+		 */
+		count = drm_if->drm_edid ? drm_edid_connector_add_modes(connector) : 0;
+		list_for_each_entry(mode, &connector->probed_modes, head) {
+			u32 hfreq = mode->htotal ? div_u64((u64)mode->clock * 1000, mode->htotal) : 0;
+
+			if (!(mode->flags & DRM_MODE_FLAG_INTERLACE) &&
+			    hfreq >= FL2000_CRT15K_HFREQ_MIN && hfreq <= FL2000_CRT15K_HFREQ_MAX)
+				usable = true;
+		}
+		if (usable)
+			return count;
+
+		return count + fl2000_crt15k_get_modes(connector);
+	}
 
 	if (drm_if->drm_edid)
 		return drm_edid_connector_add_modes(connector);
