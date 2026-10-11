@@ -8,6 +8,8 @@
  *  dump    read the whole control register space, bypassing the regmap cache
  *  frames  read frame pacing statistics from stream URB completions; write anything to reset
  *  ring    read the latest raw completion timestamps (ns), one per line, oldest first
+ *  sent    read the latest frames sent, oldest first: "ns seq hash new|rep", after a header with
+ *          the frames rendered and dropped so far (reset through "frames")
  *  pokes   bit overrides applied during every modeset, before the chip reset and again at the
  *          end: write "REG SETMASK CLRMASK" to add one, "clear" to drop them all; read lists them.
  *          For bits that only latch on reset, which live register writes cannot reveal
@@ -290,6 +292,32 @@ static int fl2000_debugfs_ring_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(fl2000_debugfs_ring);
 
+static int fl2000_debugfs_sent_show(struct seq_file *s, void *unused)
+{
+	struct fl2000_debugfs *dbg = s->private;
+	struct fl2000_sent_frame *sent;
+	unsigned int len;
+	u64 dropped;
+	u32 frame_seq;
+	int ret;
+
+	sent = kvmalloc_array(FL2000_FRAME_RING, sizeof(*sent), GFP_KERNEL);
+	if (!sent)
+		return -ENOMEM;
+
+	ret = fl2000_stream_get_sent(dbg->usb_dev, sent, &len, &dropped, &frame_seq);
+	if (!ret) {
+		seq_printf(s, "# rendered %u dropped %llu\n", frame_seq, dropped);
+		for (unsigned int i = 0; i < len; i++)
+			seq_printf(s, "%llu %u %08x %s\n", sent[i].ns, sent[i].seq, sent[i].hash,
+				   sent[i].repeat ? "rep" : "new");
+	}
+
+	kvfree(sent);
+	return ret;
+}
+DEFINE_SHOW_ATTRIBUTE(fl2000_debugfs_sent);
+
 /* Not devres managed on the USB device: that outlives this module, see fl2000_put_devices() */
 struct fl2000_debugfs *fl2000_debugfs_init(struct usb_device *usb_dev)
 {
@@ -311,6 +339,7 @@ struct fl2000_debugfs *fl2000_debugfs_init(struct usb_device *usb_dev)
 	debugfs_create_file("frames", 0600, dbg->dir, dbg, &fl2000_debugfs_frames_fops);
 	debugfs_create_file("pokes", 0600, dbg->dir, dbg, &fl2000_debugfs_pokes_fops);
 	debugfs_create_file("ring", 0400, dbg->dir, dbg, &fl2000_debugfs_ring_fops);
+	debugfs_create_file("sent", 0400, dbg->dir, dbg, &fl2000_debugfs_sent_fops);
 
 	return dbg;
 }

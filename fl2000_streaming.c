@@ -29,6 +29,8 @@ struct fl2000_stream_buf {
 	struct page **pages;
 	unsigned int nr_pages;
 	void *vaddr;
+	u32 seq;	/* frame number given by fl2000_stream_compress(), 0 for none yet */
+	u32 hash;	/* sampled content hash, to tell frames apart in the debug log */
 };
 
 struct fl2000_stream {
@@ -56,6 +58,13 @@ struct fl2000_stream {
 	u64 stat_last_ns;
 	unsigned int stat_head;
 	u64 stat_ring[FL2000_FRAME_RING];
+
+	/* What was sent, frame by frame, under list_lock: debugfs "sent" */
+	u32 frame_seq;
+	u64 dropped;
+	unsigned int sent_head;
+	u64 sent_count;
+	struct fl2000_sent_frame sent[FL2000_FRAME_RING];
 };
 
 static void fl2000_free_sb(struct fl2000_stream_buf *sb)
@@ -193,6 +202,20 @@ static void fl2000_stream_data_completion(struct urb *urb)
 	usb_free_urb(urb);
 }
 
+/* Under list_lock */
+static void fl2000_stream_record_sent(struct fl2000_stream *stream,
+				      struct fl2000_stream_buf *sb, bool repeat)
+{
+	struct fl2000_sent_frame *f = &stream->sent[stream->sent_head];
+
+	f->ns = ktime_get_ns();
+	f->seq = sb->seq;
+	f->hash = sb->hash;
+	f->repeat = repeat;
+	stream->sent_head = (stream->sent_head + 1) % FL2000_FRAME_RING;
+	stream->sent_count++;
+}
+
 static void fl2000_stream_zlp_completion(struct urb *urb)
 {
 	usb_free_urb(urb);
@@ -269,9 +292,13 @@ static void fl2000_stream_work(struct work_struct *work)
 			cur_sb = list_first_entry(&stream->render_list, struct fl2000_stream_buf,
 						  list);
 			memcpy(cur_sb->vaddr, last_sb->vaddr, stream->buf_size);
+			cur_sb->seq = last_sb->seq;
+			cur_sb->hash = last_sb->hash;
+			fl2000_stream_record_sent(stream, cur_sb, true);
 		} else {
 			cur_sb = list_first_entry(&stream->transmit_list, struct fl2000_stream_buf,
 						  list);
+			fl2000_stream_record_sent(stream, cur_sb, false);
 		}
 		list_move_tail(&cur_sb->list, &stream->wait_list);
 		spin_unlock_irqrestore(&stream->list_lock, flags);
@@ -346,7 +373,8 @@ void fl2000_stream_compress(struct fl2000_stream *stream, void *src, unsigned in
 	 * was unbound and rebound while fbdev restored its mode). Drop the frame; a BUG_ON here
 	 * killed the kworker with every modeset lock held and wedged the machine
 	 */
-	if (WARN_ON_ONCE(list_empty(&stream->render_list))) {
+	if (list_empty(&stream->render_list)) {
+		stream->dropped++;
 		spin_unlock_irqrestore(&stream->list_lock, flags);
 		return;
 	}
@@ -383,6 +411,12 @@ void fl2000_stream_compress(struct fl2000_stream *stream, void *src, unsigned in
 			dst += dst_line_len;
 		}
 	}
+
+	/* Sampled FNV-1a hash: cheap, and enough to tell frames apart in the debug log */
+	cur_sb->hash = 2166136261u;
+	for (size_t i = 0; i < stream->buf_size; i += 97)
+		cur_sb->hash = (cur_sb->hash ^ ((u8 *)cur_sb->vaddr)[i]) * 16777619u;
+	cur_sb->seq = ++stream->frame_seq;
 
 	list_move_tail(&cur_sb->list, &stream->transmit_list);
 	spin_unlock_irqrestore(&stream->list_lock, flags);
@@ -551,6 +585,28 @@ int fl2000_stream_get_stats(struct usb_device *usb_dev, struct fl2000_frame_stat
 	return 0;
 }
 
+int fl2000_stream_get_sent(struct usb_device *usb_dev, struct fl2000_sent_frame *out,
+			   unsigned int *len, u64 *dropped, u32 *frame_seq)
+{
+	struct fl2000_stream *stream = fl2000_stream_find(usb_dev);
+	unsigned int n;
+
+	if (!stream)
+		return -ENODEV;
+
+	spin_lock_irq(&stream->list_lock);
+	n = min_t(u64, stream->sent_count, FL2000_FRAME_RING);
+	for (unsigned int i = 0; i < n; i++)
+		out[i] = stream->sent[(stream->sent_head + FL2000_FRAME_RING - n + i) %
+				     FL2000_FRAME_RING];
+	*len = n;
+	*dropped = stream->dropped;
+	*frame_seq = stream->frame_seq;
+	spin_unlock_irq(&stream->list_lock);
+
+	return 0;
+}
+
 void fl2000_stream_reset_stats(struct usb_device *usb_dev)
 {
 	struct fl2000_stream *stream = fl2000_stream_find(usb_dev);
@@ -561,6 +617,9 @@ void fl2000_stream_reset_stats(struct usb_device *usb_dev)
 	spin_lock_irq(&stream->list_lock);
 	stream->stat_count = 0;
 	stream->stat_head = 0;
+	stream->sent_count = 0;
+	stream->sent_head = 0;
+	stream->dropped = 0;
 	spin_unlock_irq(&stream->list_lock);
 }
 

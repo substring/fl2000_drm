@@ -2,11 +2,13 @@
 /*
  * Set an arbitrary modeline on the FL2000 and hold it, showing a test pattern.
  *
- *   fl2k_mode [-p pattern] [-t seconds] CLOCK_MHZ HDISP HSS HSE HTOT VDISP VSS VSE VTOT [FLAGS...]
+ *   fl2k_mode [-p pattern] [-t seconds] [-a fps] CLOCK_MHZ HDISP HSS HSE HTOT VDISP VSS VSE VTOT [FLAGS...]
  *
  * The modeline uses the X11 syntax, FLAGS being any of +hsync -hsync +vsync -vsync interlace.
  * Patterns: lines (alternating 1-pixel white/black lines, the default), grid, white, bars.
  * The mode is held until the timeout expires, or until Enter/SIGINT without -t.
+ * With -a, a vertical bar sweeps across the screen, redrawn in the single framebuffer and
+ * flushed with DirtyFB fps times a second: the way X updates a PRIME sink output.
  *
  * Build: cc -O2 -o fl2k_mode fl2k_mode.c $(pkg-config --cflags --libs libdrm)
  */
@@ -20,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -92,6 +95,17 @@ static void draw(uint32_t *px, uint32_t pitch, int w, int h, const char *pattern
 	}
 }
 
+/* One animation step: a 16 pixel wide white bar at column x, black elsewhere */
+static void draw_bar(uint32_t *px, uint32_t pitch, int w, int h, int x)
+{
+	for (int y = 0; y < h; y++) {
+		uint32_t *row = (uint32_t *)((uint8_t *)px + (size_t)y * pitch);
+
+		for (int i = 0; i < w; i++)
+			row[i] = (i >= x && i < x + 16) ? 0xffffff : 0x000000;
+	}
+}
+
 static int parse_mode(int argc, char **argv, drmModeModeInfo *mode)
 {
 	double clock;
@@ -153,16 +167,20 @@ int main(int argc, char **argv)
 	uint32_t fb_id, conn_id, crtc_id;
 	uint32_t handles[4] = { 0 }, pitches[4] = { 0 }, offsets[4] = { 0 };
 	double timeout = -1;
+	double anim_fps = 0;
 	void *px;
 	int fd, opt, ret;
 
-	while ((opt = getopt(argc, argv, "+p:t:")) != -1) {
+	while ((opt = getopt(argc, argv, "+p:t:a:")) != -1) {
 		switch (opt) {
 		case 'p':
 			pattern = optarg;
 			break;
 		case 't':
 			timeout = strtod(optarg, NULL);
+			break;
+		case 'a':
+			anim_fps = strtod(optarg, NULL);
 			break;
 		default:
 			usage();
@@ -233,7 +251,28 @@ int main(int argc, char **argv)
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
 
-	if (timeout >= 0) {
+	if (anim_fps > 0) {
+		struct timespec t0, now;
+		long frame = 0;
+
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		while (!quit) {
+			double elapsed;
+
+			draw_bar(px, create.pitch, mode.hdisplay, mode.vdisplay,
+				 (int)((frame * 4) % mode.hdisplay));
+			drmModeDirtyFB(fd, fb_id, NULL, 0);
+			frame++;
+
+			/* Absolute schedule, so the update rate does not drift */
+			clock_gettime(CLOCK_MONOTONIC, &now);
+			elapsed = (now.tv_sec - t0.tv_sec) + (now.tv_nsec - t0.tv_nsec) / 1e9;
+			if (timeout >= 0 && elapsed >= timeout)
+				break;
+			if (frame / anim_fps > elapsed)
+				usleep((useconds_t)((frame / anim_fps - elapsed) * 1e6));
+		}
+	} else if (timeout >= 0) {
 		usleep((useconds_t)(timeout * 1e6));
 	} else {
 		struct pollfd pfd = { .fd = 0, .events = POLLIN };
